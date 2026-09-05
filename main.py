@@ -9,12 +9,8 @@ from typing import Optional
 from gateway.proxy import forward_to_llm
 from embeddings.encoder import get_embedding
 from embeddings.drift import check_intent_drift
-<<<<<<< HEAD
 from embeddings.rules import evaluate_security_rules
-from session.db import init_db, save_turn, get_session_history
-=======
 from session.db import init_db, save_turn, save_blocked_turn, get_session_history
->>>>>>> arjun-manoj
 from session.anchor import compute_intent_anchor
 
 app = FastAPI(title="Sentinel ATLAS - Security Gateway")
@@ -64,16 +60,15 @@ async def chat_endpoint(request: ChatRequest):
             "gate": "vector_drift"
         }
     
-
-        llm_response = await forward_to_llm(request.message)
-        save_turn(
-            session_id=session_id,
-            turn_number=turn_number,
-            message_text=request.message,
-            embedding=message_embedding,
-            similarity_score=drift_result["similarity_score"],
-            llm_response=llm_response
-        )
+    llm_response = await forward_to_llm(request.message)
+    save_turn(
+        session_id=session_id,
+        turn_number=turn_number,
+        message_text=request.message,
+        embedding=message_embedding,
+        similarity_score=drift_result["similarity_score"],
+        llm_response=llm_response
+    )
     
     return {
         "status": "success",
