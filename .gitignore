@@ -1,6 +1,8 @@
-<<<<<<< HEAD
+# Superpowers plugin (local only, not pushed to GitHub)
+.agents/
+
 ﻿venv/
-=======
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -219,4 +221,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
->>>>>>> 79a6d3f998decfa385824d6f45fbd1c5150681dd
+
