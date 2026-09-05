@@ -44,7 +44,7 @@ print("\n🧪 TEST 1: Schema has all 11 columns")
 # ══════════════════════════════════════════
 init_db()
 cols = count_columns()
-check("Total column count is 11", len(cols) == 11)
+check("Total column count is 13", len(cols) == 13)
 check("drift_score exists",       "drift_score" in cols)
 check("risk_score exists",        "risk_score" in cols)
 check("attack_technique exists",  "attack_technique" in cols)
