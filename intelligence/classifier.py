@@ -13,7 +13,7 @@ from intelligence.atlas_data import get_technique_severity, get_technique_by_id,
 
 def classify_threat(
     prompt: str,
-    distance_threshold: float = 0.45,
+    distance_threshold: float = 0.58,
     top_k: int = 3
 ) -> Dict:
     """
@@ -110,8 +110,9 @@ def classify_threat(
     }
 
 
-# Convenient alias
+# Convenient aliases
 classify_prompt = classify_threat
+classify_prompt_risk = classify_threat
 
 
 class SemanticThreatClassifier:

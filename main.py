@@ -2,6 +2,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import asyncio
+from contextlib import asynccontextmanager
 import uuid
 from typing import Optional
 from fastapi import FastAPI, BackgroundTasks
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from gateway.proxy import forward_to_llm
 from gateway.logger import log_security_event
+from gateway.async_auditor import auditor
 from embeddings.encoder import get_embedding
 from embeddings.drift import check_intent_drift
 from embeddings.rules import evaluate_security_rules
@@ -19,9 +21,16 @@ from intelligence.risk import calculate_composite_risk
 from intelligence.bridge import audit_consensus_async, check_next_turn_enforcement
 from intelligence.playbooks import sanitize_context_prompt, execute_session_reset, execute_access_revocation
 from intelligence.attribution import generate_threat_attribution_report, compute_persistence_score
+from embeddings.auditor import calculate_iaa_score, dispatch_async_audit
 
-app = FastAPI(title="Sentinel ATLAS - Security Gateway")
-init_db()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize DB and start Async Auditor queue worker
+    init_db()
+    await auditor.start()
+    yield
+
+app = FastAPI(title="Sentinel ATLAS - Security Gateway", lifespan=lifespan)
 
 # Autonomous response risk score tiers from research paper (0.0 to 1.0)
 # <= 0.25: allow, 0.26-0.45: sanitize, 0.46-0.70: reset, > 0.70: revoke
@@ -59,7 +68,16 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
     rule_check = evaluate_security_rules(request.message)
     if rule_check["flagged"]:
         event_type = "rule_engine_secret" if "secret" in rule_check["reason"].lower() else "rule_engine_injection"
+        
+        # Async non-blocking queue dispatch (Phase 2 - Person B)
+        await auditor.log_event_async(session_id, event_type, {
+            "reason": rule_check["reason"],
+            "prompt": request.message,
+            "detector_flag": 1
+        })
+        
         log_security_event(event_type, session_id, {"reason": rule_check["reason"], "prompt": request.message})
+        
         save_blocked_turn(
             session_id=session_id,
             turn_number=0,
@@ -72,7 +90,8 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
             "status": "blocked",
             "reason": rule_check["reason"],
             "session_id": session_id,
-            "gate": "rule_engine"
+            "gate": "rule_engine",
+            "detector_flag": 1
         }
 
     # 2. LLM Semantic Safety Check (uses Ollama to classify intent)
@@ -145,13 +164,34 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
                 threshold=0.35,
                 reason=revocation["reason"]
             )
+            await auditor.log_event_async(session_id, "vector_drift", {
+                "reason": revocation["reason"],
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "prompt": request.message,
+                "detector_flag": 1,
+                "playbook_action": "revoke",
+                "risk_score": score
+            })
+            log_security_event("vector_drift", session_id, {
+                "reason": revocation["reason"],
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "prompt": request.message,
+                "playbook_action": "revoke"
+            })
             return {
                 "status": "blocked",
                 "reason": revocation["reason"],
                 "session_id": session_id,
+                "turn_number": turn_number,
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "turns_evaluated": drift_result["window_turns_evaluated"],
                 "gate": "risk_engine",
                 "risk_score": score,
-                "playbook_action": "revoke"
+                "playbook_action": "revoke",
+                "detector_flag": 1
             }
 
         # Score 0.46 - 0.70: Session Reset (wipe memory, break multi-turn attack)
@@ -165,19 +205,47 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
                 threshold=0.35,
                 reason=reset_action["reason"]
             )
+            await auditor.log_event_async(session_id, "vector_drift", {
+                "reason": reset_action["reason"],
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "prompt": request.message,
+                "detector_flag": 1,
+                "playbook_action": "reset",
+                "risk_score": score
+            })
+            log_security_event("vector_drift", session_id, {
+                "reason": reset_action["reason"],
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "prompt": request.message,
+                "playbook_action": "reset"
+            })
             return {
                 "status": "blocked",
                 "reason": reset_action["reason"],
                 "session_id": session_id,
+                "turn_number": turn_number,
+                "similarity_score": drift_result["similarity_score"],
+                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+                "turns_evaluated": drift_result["window_turns_evaluated"],
                 "gate": "risk_engine",
                 "risk_score": score,
-                "playbook_action": "reset"
+                "playbook_action": "reset",
+                "detector_flag": 1
             }
 
         # Score 0.26 - 0.45: Context Sanitisation (clean input, rebuild using core noun phrases)
         elif score > 0.25:
             applied_playbook = "sanitize"
+            anchor_text = history[0]["message_text"] if history else request.message
             outbound_prompt = sanitize_context_prompt(request.message, anchor_text, session_id)
+            await auditor.log_event_async(session_id, "playbook_sanitize", {
+                "original_prompt": request.message,
+                "sanitized_prompt": outbound_prompt,
+                "risk_score": score,
+                "detector_flag": 1
+            })
             log_security_event("playbook_sanitize", session_id, {
                 "original_prompt": request.message,
                 "sanitized_prompt": outbound_prompt,
@@ -186,8 +254,21 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
 
     # 5. Forward to Worker Agent (Zero latency penalty to user)
     llm_response = await forward_to_llm(outbound_prompt)
-    
-    # Save conversation turn
+
+    # 4. Intent Alignment Assessment (IAA) & Async Secondary Auditor (Person B)
+    anchor_text = history[0]["message_text"] if history else request.message
+    iaa_score = calculate_iaa_score(intent_anchor, llm_response)
+
+    # Non-blocking background audit via secondary Ollama model
+    dispatch_async_audit(
+        session_id=session_id,
+        turn_number=turn_number,
+        anchor_text=anchor_text,
+        user_prompt=request.message,
+        llm_response=llm_response,
+        iaa_score=iaa_score
+    )
+
     save_turn(
         session_id=session_id,
         turn_number=turn_number,
@@ -219,9 +300,11 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
         "turn_number": turn_number,
         "similarity_score": drift_result["similarity_score"],
         "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+        "iaa_score": iaa_score,
         "gate": "passed",
         "playbook_action": applied_playbook,
         "sanitized": (applied_playbook == "sanitize"),
+        "detector_flag": 0,
         "llm_response": llm_response
     }
 

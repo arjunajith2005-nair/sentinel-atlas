@@ -145,8 +145,7 @@ def calculate_composite_risk(
     # 5. Composite Risk Formula Calculation
     comp_drift = w1 * drift_deviation
     comp_attack = w2 * attack_confidence
-    # Modulate technique severity by attack confidence to prevent low-confidence false positives
-    comp_severity = w3 * (technique_severity * attack_confidence)
+    comp_severity = w3 * technique_severity
     comp_history = w4 * history_penalty
 
     raw_risk = comp_drift + comp_attack + comp_severity + comp_history
