@@ -15,6 +15,7 @@ from embeddings.drift import check_intent_drift
 from embeddings.rules import evaluate_security_rules
 from session.db import init_db, save_turn, save_blocked_turn, get_session_history
 from session.anchor import compute_intent_anchor
+from embeddings.auditor import calculate_iaa_score, dispatch_async_audit
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -119,6 +120,21 @@ async def chat_endpoint(request: ChatRequest):
     
     # 3. Save Turn and Forward Downstream
     llm_response = await forward_to_llm(request.message)
+
+    # 4. Intent Alignment Assessment (IAA) & Async Secondary Auditor (Person B)
+    anchor_text = history[0]["message_text"] if history else request.message
+    iaa_score = calculate_iaa_score(intent_anchor, llm_response)
+
+    # Non-blocking background audit via secondary Ollama model
+    dispatch_async_audit(
+        session_id=session_id,
+        turn_number=turn_number,
+        anchor_text=anchor_text,
+        user_prompt=request.message,
+        llm_response=llm_response,
+        iaa_score=iaa_score
+    )
+
     save_turn(
         session_id=session_id,
         turn_number=turn_number,
@@ -134,6 +150,7 @@ async def chat_endpoint(request: ChatRequest):
         "turn_number": turn_number,
         "similarity_score": drift_result["similarity_score"],
         "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+        "iaa_score": iaa_score,
         "gate": "passed",
         "detector_flag": 0,
         "llm_response": llm_response
