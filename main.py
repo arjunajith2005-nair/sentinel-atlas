@@ -1,6 +1,7 @@
 import sys
 sys.dont_write_bytecode = True
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uuid
@@ -8,13 +9,21 @@ from typing import Optional
 
 from gateway.proxy import forward_to_llm
 from gateway.logger import log_security_event
+from gateway.async_auditor import auditor
 from embeddings.encoder import get_embedding
 from embeddings.drift import check_intent_drift
 from embeddings.rules import evaluate_security_rules
 from session.db import init_db, save_turn, save_blocked_turn, get_session_history
 from session.anchor import compute_intent_anchor
-app = FastAPI(title="Sentinel ATLAS - Security Gateway")
-init_db()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize DB and start Async Auditor queue worker
+    init_db()
+    await auditor.start()
+    yield
+
+app = FastAPI(title="Sentinel ATLAS - Security Gateway", lifespan=lifespan)
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
@@ -28,7 +37,16 @@ async def chat_endpoint(request: ChatRequest):
     rule_check = evaluate_security_rules(request.message)
     if rule_check["flagged"]:
         event_type = "rule_engine_secret" if "secret" in rule_check["reason"].lower() else "rule_engine_injection"
+        
+        # Async non-blocking queue dispatch (Phase 2 - Person B)
+        await auditor.log_event_async(session_id, event_type, {
+            "reason": rule_check["reason"],
+            "prompt": request.message,
+            "detector_flag": 1
+        })
+        
         log_security_event(event_type, session_id, {"reason": rule_check["reason"], "prompt": request.message})
+        
         save_blocked_turn(
             session_id=session_id,
             turn_number=0,
@@ -42,7 +60,8 @@ async def chat_endpoint(request: ChatRequest):
             "status": "blocked",
             "reason": rule_check["reason"],
             "session_id": session_id,
-            "gate": "rule_engine"
+            "gate": "rule_engine",
+            "detector_flag": 1
         }
 
     # Fetch existing session history from Person A's db module
@@ -62,6 +81,15 @@ async def chat_endpoint(request: ChatRequest):
     )
     
     if drift_result["drift_detected"]:
+        # Async non-blocking queue dispatch (Phase 2 - Person B)
+        await auditor.log_event_async(session_id, "vector_drift", {
+            "reason": "4-Turn rolling average or instant similarity below threshold",
+            "similarity_score": drift_result["similarity_score"],
+            "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+            "prompt": request.message,
+            "detector_flag": 1
+        })
+
         save_blocked_turn(
             session_id=session_id,
             turn_number=turn_number,
@@ -85,7 +113,8 @@ async def chat_endpoint(request: ChatRequest):
             "similarity_score": drift_result["similarity_score"],
             "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
             "turns_evaluated": drift_result["window_turns_evaluated"],
-            "gate": "vector_drift"
+            "gate": "vector_drift",
+            "detector_flag": 1
         }
     
     # 3. Save Turn and Forward Downstream
@@ -106,6 +135,7 @@ async def chat_endpoint(request: ChatRequest):
         "similarity_score": drift_result["similarity_score"],
         "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
         "gate": "passed",
+        "detector_flag": 0,
         "llm_response": llm_response
     }
 
