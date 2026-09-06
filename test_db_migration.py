@@ -7,6 +7,10 @@ from session.db import (
     update_turn_scores, mark_false_positive, upgrade_schema,
 )
 import sqlite3
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 DB_PATH = "sentinel_sessions.db"
 TEST_SESSION = "test-raif-001"
