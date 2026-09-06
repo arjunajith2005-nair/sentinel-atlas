@@ -1,0 +1,22 @@
+# Sentinel ATLAS — Requirements Specification
+# Core Framework & API
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+httpx>=0.27.0
+requests>=2.31.0
+
+# Vector Embeddings & Threat Intelligence
+sentence-transformers>=3.0.0
+chromadb>=0.4.24
+torch>=2.2.0
+
+# Operations, Math & Local LLM
+numpy>=1.26.0
+scipy>=1.12.0
+ollama>=0.2.0
+
+# Visual Operations Center & Analytics Dashboard
+streamlit>=1.32.0
+plotly>=5.20.0
+pandas>=2.2.0

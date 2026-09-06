@@ -215,3 +215,57 @@ def get_technique_by_id(technique_id: str) -> Optional[Dict]:
     Retrieves metadata for a specific technique ID.
     """
     return get_technique_dict().get(technique_id)
+
+
+# MITRE ATLAS Threat Severity Weights (0.0 to 1.0)
+# Maps both base technique IDs (e.g. AML.T0051, AML.T0024) and sub-techniques.
+SEVERITY_WEIGHTS: Dict[str, float] = {
+    # High-impact Prompt & Execution Attacks
+    "AML.T0051": 0.95,        # LLM Prompt Injection (Base)
+    "AML.T0051.000": 0.95,    # Direct Prompt Injection
+    "AML.T0051.001": 0.90,    # Indirect Prompt Injection
+    "AML.T0054": 0.95,        # LLM Jailbreak
+    "AML.T0031": 0.95,        # LLM Agent Tool Hijacking
+    
+    # Exfiltration & Data Leakage
+    "AML.T0057": 0.90,        # LLM Data Leakage
+    "AML.T0024": 0.85,        # Exfiltration via ML Inference API
+    "AML.T0056": 0.85,        # System Prompt Extraction
+    
+    # Persistence & Defense Evasion
+    "AML.T0016": 0.85,        # Model Poisoning
+    "AML.T0015": 0.80,        # Evade ML Model
+    "AML.T0043": 0.75,        # Craft Adversarial Data
+    
+    # Discovery & Reconnaissance
+    "AML.T0040": 0.80,        # ML Model Inversion
+    "AML.T0044": 0.65,        # Discover ML Model Architecture
+}
+
+
+def get_technique_severity(technique_id: Optional[str], default: float = 0.5) -> float:
+    """
+    Retrieves the severity weight for a given MITRE ATLAS technique ID.
+    Supports sub-technique fallback (e.g., 'AML.T0051.000' -> 'AML.T0051').
+    Returns 0.0 if technique_id is None.
+    """
+    if not technique_id:
+        return 0.0
+    
+    cleaned_id = technique_id.strip()
+    if cleaned_id in SEVERITY_WEIGHTS:
+        return SEVERITY_WEIGHTS[cleaned_id]
+        
+    # Check parent ID if subtechnique (e.g., AML.T0051.000 -> AML.T0051)
+    if "." in cleaned_id:
+        parent_id = cleaned_id.rsplit(".", 1)[0]
+        if parent_id in SEVERITY_WEIGHTS:
+            return SEVERITY_WEIGHTS[parent_id]
+            
+    # Check if technique is in catalog
+    tech_meta = get_technique_by_id(cleaned_id)
+    if tech_meta and "sensitivity" in tech_meta:
+        return float(tech_meta["sensitivity"])
+        
+    return default
+

@@ -103,7 +103,7 @@ def build_atlas_index(force_rebuild: bool = False) -> int:
     
     return collection.count()
 
-def match_atlas_technique(prompt: str, top_k: int = 3, distance_threshold: float = 0.58) -> Dict:
+def match_atlas_technique(prompt: str, top_k: int = 3, distance_threshold: float = 0.45) -> Dict:
     """
     Semantically searches the MITRE ATLAS index for closest attack pattern matches.
     
@@ -111,7 +111,7 @@ def match_atlas_technique(prompt: str, top_k: int = 3, distance_threshold: float
         prompt: User message / suspicious query to classify.
         top_k: Number of candidate techniques to retrieve.
         distance_threshold: Maximum cosine distance to qualify as an attack match 
-                            (Distance 0.58 = Similarity 0.42).
+                            (Distance 0.45 = Similarity 0.55).
                             
     Returns:
         Structured match dictionary with confidence and sensitivity scores.

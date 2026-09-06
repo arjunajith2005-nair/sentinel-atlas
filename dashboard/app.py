@@ -18,7 +18,7 @@ st.set_page_config(
 # Resolve database path relative to workspace
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DB_PATH = os.path.join(BASE_DIR, "sentinel_sessions.db")
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8001")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
 # Custom CSS for dark cybersecurity dashboard aesthetic
@@ -243,9 +243,10 @@ kpi4.metric("Avg Similarity Score", f"{mean_sim:.3f}")
 st.markdown("---")
 
 # ================= MAIN TABS =================
-tab_monitor, tab_audit, tab_playground = st.tabs([
+tab_monitor, tab_audit, tab_attribution, tab_playground = st.tabs([
     "📈 Session Drift Monitor", 
     "🚨 Security Incidents Audit", 
+    "📑 Threat Attribution & AI Reports",
     "🧪 Live Gateway Playground"
 ])
 
@@ -391,7 +392,85 @@ with tab_audit:
             mime="text/csv"
         )
 
-# ------------- TAB 3: LIVE GATEWAY PLAYGROUND -------------
+# ------------- TAB 3: THREAT ATTRIBUTION & AI REPORTS -------------
+with tab_attribution:
+    st.subheader("📑 Threat Attribution & Dual-Agent Consensus")
+    st.caption("Traces sustained attack paths (Persistence Score), dual-agent consensus verdicts, and AI-synthesized incident reports.")
+
+    if not selected_session:
+        st.info("Select a session in the sidebar to view its threat attribution analysis.")
+    else:
+        # Fetch persistence and path data via API or DB
+        try:
+            pers_res = requests.get(f"{GATEWAY_URL}/attribution/persistence/{selected_session}", timeout=3.0)
+            persistence_data = pers_res.json() if pers_res.status_code == 200 else {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+        except Exception:
+            persistence_data = {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+
+        col_p1, col_p2, col_p3 = st.columns(3)
+        col_p1.metric("Persistence Streak", f"{persistence_data['max_streak']} Turns", help="Maximum consecutive turns exhibiting semantic drift or security flags.")
+        col_p2.metric("Sustained Exploit Intent", "🚨 YES" if persistence_data['sustained_intent'] else "✅ NO", help="Flagged if 3 or more consecutive turns show anomalous semantic drift.")
+        col_p3.metric("Selected Session", f"`{selected_session[:14]}...`")
+
+        st.markdown("---")
+
+        # Dual-Agent Consensus Events
+        st.markdown("### 🤝 Dual-Agent Consensus (ATLAS Bridge)")
+        st.caption("Worker Agent proposed action vs. Asynchronous Auditor Agent alignment verdict.")
+        conn = get_db_connection()
+        try:
+            consensus_df = pd.read_sql_query(
+                "SELECT turn_number, iaa_score, auditor_verdict, auditor_reason, timestamp FROM consensus_events WHERE session_id = ? ORDER BY turn_number DESC",
+                conn,
+                params=(selected_session,)
+            )
+        except Exception:
+            consensus_df = pd.DataFrame()
+        conn.close()
+
+        if consensus_df.empty:
+            st.info("No dual-agent consensus events recorded for this session yet.")
+        else:
+            st.dataframe(
+                consensus_df,
+                column_config={
+                    "turn_number": st.column_config.NumberColumn("Turn #", width="small"),
+                    "iaa_score": st.column_config.NumberColumn("IAA Alignment", format="%.4f"),
+                    "auditor_verdict": st.column_config.TextColumn("Auditor Verdict", width="small"),
+                    "auditor_reason": st.column_config.TextColumn("Auditor Rationale", width="large"),
+                    "timestamp": st.column_config.DatetimeColumn("Timestamp", width="medium"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+
+        st.markdown("---")
+
+        # Executive Incident Report Generation
+        st.markdown("### 📝 Plain-English SOC Threat Attribution Report")
+        st.caption("Generates a comprehensive incident report using local Ollama, detailing attacker progression across MITRE ATLAS tactics over time.")
+
+        if st.button("⚡ Generate AI Threat Attribution Report", key="btn_gen_report", use_container_width=True):
+            with st.spinner("Local Ollama analyzing session progression and generating report..."):
+                try:
+                    rep_res = requests.get(f"{GATEWAY_URL}/attribution/report/{selected_session}", timeout=45.0)
+                    if rep_res.status_code == 200:
+                        report_content = rep_res.json().get("report", "No report generated.")
+                        st.session_state[f"report_{selected_session}"] = report_content
+                    else:
+                        st.error(f"Error from report API: HTTP {rep_res.status_code}")
+                except Exception as ex:
+                    st.error(f"Could not connect to Gateway: {ex}")
+
+        saved_report = st.session_state.get(f"report_{selected_session}")
+        if saved_report:
+            st.markdown(f"""
+            <div style="background-color:#161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-top: 15px;">
+                {saved_report}
+            </div>
+            """, unsafe_allow_html=True)
+
+# ------------- TAB 4: LIVE GATEWAY PLAYGROUND -------------
 with tab_playground:
     st.subheader("Interactive Security Gateway Playground")
     st.caption("Test prompts directly against your running FastAPI security proxy (`http://127.0.0.1:8000/chat`).")
@@ -428,17 +507,22 @@ with tab_playground:
                 data = resp.json()
                 status = data.get("status")
                 sim_score = data.get("similarity_score", 0.0)
+                playbook_act = data.get("playbook_action", "allow")
+                is_sanitized = data.get("sanitized", False)
                 
                 if status == "success":
-                    st.success(f"✅ **Request Allowed!** Cosine Similarity: `{sim_score:.4f}` >= `0.35`")
+                    if is_sanitized:
+                        st.warning(f"🛡️ **Playbook: Context Sanitisation Applied!** (Score 26–45). Adversarial framing stripped; forwarded clean intent.")
+                    else:
+                        st.success(f"✅ **Request Allowed!** Cosine Similarity: `{sim_score:.4f}` >= `0.35` | Playbook: `{playbook_act}`")
+                    
                     with st.chat_message("assistant"):
                         st.markdown(f"**LLM Output:**\n\n{data.get('llm_response')}")
                 else:
-                    st.error(f"🚨 **Request Blocked!** Cosine Similarity: `{sim_score:.4f}` < `0.35`")
+                    st.error(f"🚨 **Request Blocked!** Intercepted at Gate: `{data.get('gate')}` | Playbook: `{playbook_act}`")
                     st.warning(f"**Reason:** {data.get('reason')}")
                 
                 st.json(data)
-                # Suggest refreshing to see the new turn
                 if st.button("🔄 Refresh Timeline to View Turn in Monitor"):
                     st.rerun()
             else:

@@ -1,3 +1,11 @@
 {
+    "python.defaultInterpreterPath": "C:\\Users\\nandu\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "python.analysis.typeCheckingMode": "basic",
     "python-envs.defaultEnvManager": "ms-python.python:system"
 }

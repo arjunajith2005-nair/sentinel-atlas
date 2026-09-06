@@ -46,6 +46,20 @@ def init_db():
         )
     """)
 
+    # Dual-Agent consensus events table (ATLAS Bridge Worker vs Auditor)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS consensus_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            turn_number INTEGER NOT NULL,
+            iaa_score REAL NOT NULL,
+            auditor_verdict TEXT NOT NULL,
+            auditor_reason TEXT,
+            enforced INTEGER DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -267,6 +281,82 @@ def get_security_events(session_id: str = None):
         cursor.execute("""
             SELECT id, session_id, turn_number, message_text, similarity_score, threshold, reason, timestamp
             FROM security_events ORDER BY timestamp DESC
+        """)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def save_consensus_event(session_id: str, turn_number: int, iaa_score: float, auditor_verdict: str, auditor_reason: str):
+    """
+    Logs an Intent-Action Alignment (IAA) dual-agent evaluation result.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO consensus_events (session_id, turn_number, iaa_score, auditor_verdict, auditor_reason, enforced)
+        VALUES (?, ?, ?, ?, ?, 0)
+    """, (session_id, turn_number, iaa_score, auditor_verdict, auditor_reason))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_consensus_alert(session_id: str):
+    """
+    Checks if there is a pending, un-enforced MISALIGNED verdict from the Auditor Agent for this session.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, turn_number, iaa_score, auditor_verdict, auditor_reason, timestamp
+        FROM consensus_events
+        WHERE session_id = ? AND auditor_verdict = 'MISALIGNED' AND enforced = 0
+        ORDER BY id DESC LIMIT 1
+    """, (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "turn_number": row[1],
+            "iaa_score": row[2],
+            "auditor_verdict": row[3],
+            "auditor_reason": row[4],
+            "timestamp": row[5]
+        }
+    return None
+
+
+def mark_consensus_enforced(session_id: str):
+    """
+    Marks all pending consensus alerts for a session as enforced.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE consensus_events
+        SET enforced = 1
+        WHERE session_id = ? AND enforced = 0
+    """, (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_consensus_history(session_id: str = None):
+    """
+    Retrieves dual-agent consensus audit history.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if session_id:
+        cursor.execute("""
+            SELECT id, session_id, turn_number, iaa_score, auditor_verdict, auditor_reason, enforced, timestamp
+            FROM consensus_events WHERE session_id = ? ORDER BY timestamp DESC
+        """, (session_id,))
+    else:
+        cursor.execute("""
+            SELECT id, session_id, turn_number, iaa_score, auditor_verdict, auditor_reason, enforced, timestamp
+            FROM consensus_events ORDER BY timestamp DESC
         """)
     rows = cursor.fetchall()
     conn.close()
