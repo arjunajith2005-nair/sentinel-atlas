@@ -1,5 +1,6 @@
 # Superpowers plugin (local only, not pushed to GitHub)
 .agents/
+intelligence/chroma_store/
 
 ﻿venv/
 
