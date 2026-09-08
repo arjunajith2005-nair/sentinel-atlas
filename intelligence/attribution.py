@@ -30,10 +30,10 @@ def compute_persistence_score(session_id: str, similarity_threshold: float = 0.4
     max_streak = 0
     
     for turn in history:
-        sim = turn.get("similarity_score")
+        drift = turn.get("drift_score")
         technique = turn.get("attack_technique")
         
-        is_drifting = (sim is not None and sim < similarity_threshold) or (technique is not None)
+        is_drifting = (drift is not None and drift < similarity_threshold) or (technique is not None)
         if is_drifting:
             current_streak += 1
             if current_streak > max_streak:

@@ -8,31 +8,53 @@ Computes normalized composite risk scores combining:
 3. MITRE ATLAS technique severity: w3 * technique_severity
 4. Session history flag penalty: w4 * history_penalty
 
-Maps risk scores to 4 operational tiers and automated playbook actions:
-- Score >= 0.85: Level "CRITICAL", Action "revoke"
-- Score >= 0.60: Level "HIGH", Action "reset"
-- Score >= 0.35: Level "MEDIUM", Action "sanitize"
-- Score < 0.35: Level "LOW", Action "allow"
+Maps risk scores to 4 operational tiers and automated playbook actions.
+These bands are the SINGLE SOURCE OF TRUTH for enforcement — main.py dispatches
+on the `recommended_action` returned here rather than re-deriving thresholds.
+Values follow the research paper (Page 7, Bullet 3), normalized to 0.0-1.0:
+- Score >  0.70: Level "CRITICAL", Action "revoke"   (paper: > 70)
+- Score >  0.45: Level "HIGH",     Action "reset"    (paper: 46 - 70)
+- Score >  0.25: Level "MEDIUM",   Action "sanitize" (paper: 26 - 45)
+- Score <= 0.25: Level "LOW",      Action "allow"    (paper: <= 25)
 """
 
 from typing import Dict, Optional
 from intelligence.classifier import classify_threat
 
-# Balanced default risk factor weights (w1 + w2 + w3 + w4 = 1.0)
+# Balanced default risk factor weights (w1 + w2 + w3 + w4 = 1.0).
+#
+# Tuned against the 15-case adversarial suite plus the benign corpus. Two
+# invariants drive these values — see test_risk_engine.py, which asserts both:
+#
+#   1. w1 > 0.25, so maximum topic drift ON ITS OWN reaches sanitize.
+#      At the previous w1 = 0.20, drift could contribute at most 0.20 against a
+#      lowest action threshold of 0.25 — the factor was mathematically incapable
+#      of ever triggering a playbook, at any drift value. Benign-but-off-mission
+#      prompts (a recipe, a football score) sailed through a drifting session.
+#
+#   2. w1 + w4 <= 0.45, the top of the sanitize band. Being off-topic AND a
+#      repeat offender, with NO attack evidence, must never escalate to session
+#      reset or revocation. Only w2/w3 — actual MITRE ATLAS match evidence — can
+#      push a turn past sanitize.
 DEFAULT_WEIGHTS = {
-    "w1": 0.20,  # Intent drift deviation (1.0 - drift_score)
-    "w2": 0.30,  # MITRE ATLAS attack match confidence
-    "w3": 0.30,  # MITRE ATLAS technique severity weight
-    "w4": 0.20,  # Session historical violation penalty
+    "w1": 0.300,  # Intent drift deviation (1.0 - drift_score)
+    "w2": 0.275,  # MITRE ATLAS attack match confidence
+    "w3": 0.275,  # MITRE ATLAS technique severity (scaled by match confidence)
+    "w4": 0.150,  # Session historical violation penalty
 }
 
-# Operational thresholds for risk levels and playbook responses
+# Operational thresholds for risk levels and playbook responses.
+# Bands are exclusive lower bounds (score > above_score), matching the paper's
+# "26 - 45 / 46 - 70 / > 70" phrasing: a score of exactly 0.45 is MEDIUM, not HIGH.
 RISK_TIERS = [
-    {"min_score": 0.85, "level": "CRITICAL", "action": "revoke"},
-    {"min_score": 0.60, "level": "HIGH", "action": "reset"},
-    {"min_score": 0.35, "level": "MEDIUM", "action": "sanitize"},
-    {"min_score": 0.00, "level": "LOW", "action": "allow"},
+    {"above_score": 0.70, "level": "CRITICAL", "action": "revoke"},
+    {"above_score": 0.45, "level": "HIGH", "action": "reset"},
+    {"above_score": 0.25, "level": "MEDIUM", "action": "sanitize"},
+    {"above_score": -1.0, "level": "LOW", "action": "allow"},
 ]
+
+# Actions that terminate the request instead of forwarding it to the Worker Agent.
+BLOCKING_ACTIONS = {"revoke", "reset"}
 
 
 def compute_history_penalty(previous_flags: int, turn_number: int) -> float:
@@ -70,12 +92,12 @@ def compute_history_penalty(previous_flags: int, turn_number: int) -> float:
 def determine_risk_tier(score: float) -> tuple[str, str]:
     """
     Maps a normalized risk score [0.0, 1.0] to a risk level and playbook action.
-    
+
     Returns:
         tuple[str, str]: (risk_level, recommended_action)
     """
     for tier in RISK_TIERS:
-        if score >= tier["min_score"]:
+        if score > tier["above_score"]:
             return tier["level"], tier["action"]
     return "LOW", "allow"
 
@@ -86,7 +108,9 @@ def calculate_composite_risk(
     turn_number: int,
     previous_flags: int = 0,
     weights: Optional[Dict[str, float]] = None,
-    distance_threshold: float = 0.45
+    distance_threshold: float = 0.45,
+    query_embedding: Optional[list] = None,
+    classification: Optional[Dict] = None
 ) -> Dict:
     """
     Calculates the composite risk score for a prompt within an active session.
@@ -102,6 +126,11 @@ def calculate_composite_risk(
         previous_flags: Count of prior flagged or blocked events in this session.
         weights: Optional dictionary overriding default weights {'w1', 'w2', 'w3', 'w4'}.
         distance_threshold: Semantic distance cutoff for attack classifier matching.
+        query_embedding: Optional precomputed embedding of `prompt_text`.
+        classification: Optional already-computed classify_threat() result, reused
+                        instead of re-querying ChromaDB. The gateway classifies
+                        every turn independently (so detector and classifier act as
+                        two independent raters), then hands the result in here.
         
     Returns:
         Dict containing composite score, level, action, technique metadata, and component breakdown.
@@ -118,10 +147,12 @@ def calculate_composite_risk(
     drift_deviation = round(1.0 - clamped_drift, 4)
 
     # 3. Factor 2 & 3: Threat Classification & Severity
-    classification = classify_threat(
-        prompt=prompt_text,
-        distance_threshold=distance_threshold
-    )
+    if classification is None:
+        classification = classify_threat(
+            prompt=prompt_text,
+            distance_threshold=distance_threshold,
+            query_embedding=query_embedding
+        )
 
     is_matched = classification["matched"]
     if is_matched:
@@ -145,7 +176,11 @@ def calculate_composite_risk(
     # 5. Composite Risk Formula Calculation
     comp_drift = w1 * drift_deviation
     comp_attack = w2 * attack_confidence
-    comp_severity = w3 * technique_severity
+    # Severity is weighted BY the match confidence, per the documented formula.
+    # It previously used raw severity, so a marginal 0.61-confidence match to a
+    # 0.90-severity technique contributed exactly as much as a certain one —
+    # enough on its own to push benign prompts to CRITICAL/revoke.
+    comp_severity = w3 * technique_severity * attack_confidence
     comp_history = w4 * history_penalty
 
     raw_risk = comp_drift + comp_attack + comp_severity + comp_history

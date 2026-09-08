@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import sqlite3
-import requests
+import httpx
 import os
 import sys
 from datetime import datetime
@@ -71,10 +71,25 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def get_db_connection():
-    return sqlite3.connect(DB_PATH, timeout=10)
 
+# ================= CACHED RESOURCE: HTTP CLIENT POOL =================
+@st.cache_resource
+def get_http_client():
+    """Shared connection-pooled HTTP client — avoids recreating sockets on every Streamlit rerun."""
+    return httpx.Client(
+        timeout=2.0,
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    )
+
+
+# ================= CACHED DATA FUNCTIONS =================
+def get_db_connection():
+    return sqlite3.connect(DB_PATH, timeout=5)
+
+
+@st.cache_data(ttl=10)
 def fetch_overview_metrics():
+    """Cached overview metrics — refreshes every 10 seconds instead of every rerun."""
     conn = get_db_connection()
     c = conn.cursor()
     
@@ -104,7 +119,10 @@ def fetch_overview_metrics():
     conn.close()
     return total_sessions, total_turns, blocked_count, avg_score
 
+
+@st.cache_data(ttl=5)
 def fetch_all_sessions():
+    """Cached session list — refreshes every 5 seconds."""
     conn = get_db_connection()
     query = """
     SELECT 
@@ -119,7 +137,10 @@ def fetch_all_sessions():
     conn.close()
     return df
 
+
+@st.cache_data(ttl=5)
 def fetch_session_timeline(session_id):
+    """Cached per-session timeline — refreshes every 5 seconds."""
     conn = get_db_connection()
     
     # Valid turns
@@ -160,7 +181,10 @@ def fetch_session_timeline(session_id):
         combined = combined.sort_values(by=["turn_number", "timestamp"]).reset_index(drop=True)
     return combined
 
+
+@st.cache_data(ttl=10)
 def fetch_all_security_events():
+    """Cached security events — refreshes every 10 seconds."""
     conn = get_db_connection()
     try:
         query = """
@@ -174,20 +198,167 @@ def fetch_all_security_events():
     conn.close()
     return df
 
-def check_service_health(url):
+
+# Rule-engine and safety-model blocks never reach the ATLAS classifier (they are
+# refused on the fast path, before embedding), so they carry no technique label.
+# They are still attack types, and they are the MAJORITY of interceptions -- a
+# chart drawn only from ATLAS matches would omit most of what the gateway stops.
+# These patterns fold those blocks into the same taxonomy.
+RULE_LABELS = [
+    ("prompt injection attempt", "Prompt Injection", "Rule Engine"),
+    ("high-entropy secret", "Secret / Token Exposure", "Rule Engine"),
+    ("weapons or dangerous substances", "Harmful: Weapons", "Rule Engine"),
+    ("unauthorized system access", "Harmful: Unauthorized Access", "Rule Engine"),
+    ("cyberattack technique", "Harmful: Cyberattack Technique", "Rule Engine"),
+    ("credential theft", "Harmful: Credential Theft", "Rule Engine"),
+    ("malicious software", "Harmful: Malware", "Rule Engine"),
+    ("weapons of mass destruction", "Harmful: WMD", "Rule Engine"),
+    ("harmful content", "Harmful: Other", "Rule Engine"),
+    ("llm safety classifier", "Unsafe Content", "Safety Model"),
+    ("dual-agent consensus", "Consensus Misalignment", "Auditor Agent"),
+    ("intent drift", "Intent Drift", "Drift Detector"),
+    ("session memory and intent anchor", "Intent Drift", "Risk Engine"),
+    ("access revocation", "Critical Risk Escalation", "Risk Engine"),
+]
+
+
+def _label_unclassified(reason: str):
+    """Maps a non-ATLAS block reason onto an attack-type label and its detecting gate."""
+    text = (reason or "").lower()
+    for needle, label, source in RULE_LABELS:
+        if needle in text:
+            return label, source
+    return "Unclassified", "Other"
+
+
+@st.cache_data(ttl=10)
+def fetch_attack_matrix():
+    """
+    Attack type x playbook response matrix, refreshed every 10 seconds.
+
+    Unions both tables on purpose. Blocked attacks live only in security_events
+    (the session-reset playbook wipes session_turns), while sanitized and allowed
+    turns live only in session_turns -- reading either alone drops half the picture.
+    Rows without an ATLAS technique are labelled from their block reason so that
+    fast-path refusals are represented too.
+    """
+    conn = get_db_connection()
     try:
-        res = requests.get(url, timeout=5.0)
-        return res.status_code in [200, 404, 307]
+        query = """
+        SELECT attack_technique, tactic, reason,
+               COALESCE(playbook_action, 'blocked') AS playbook_action,
+               timestamp
+        FROM security_events
+        UNION ALL
+        SELECT attack_technique, NULL AS tactic, NULL AS reason,
+               COALESCE(playbook_action, 'allow') AS playbook_action,
+               timestamp
+        FROM session_turns
+        WHERE attack_technique IS NOT NULL
+        """
+        df = pd.read_sql_query(query, conn)
+    except sqlite3.OperationalError:
+        conn.close()
+        return pd.DataFrame(columns=["attack_type", "tactic", "playbook_action", "detected_by", "timestamp"])
+    conn.close()
+
+    if df.empty:
+        df["attack_type"] = []
+        df["detected_by"] = []
+        return df
+
+    labelled = df["attack_technique"].notna()
+    df.loc[labelled, "attack_type"] = df.loc[labelled, "attack_technique"]
+    df.loc[labelled, "detected_by"] = "ATLAS Classifier"
+
+    if (~labelled).any():
+        derived = df.loc[~labelled, "reason"].apply(_label_unclassified)
+        df.loc[~labelled, "attack_type"] = [d[0] for d in derived]
+        df.loc[~labelled, "detected_by"] = [d[1] for d in derived]
+
+    return df
+
+
+@st.cache_data(ttl=5)
+def fetch_live_alerts(limit: int = 25):
+    """Most recent security interceptions across all sessions, newest first."""
+    conn = get_db_connection()
+    try:
+        query = """
+        SELECT timestamp, session_id, turn_number, message_text, reason,
+               attack_technique, tactic, risk_score,
+               COALESCE(playbook_action, 'blocked') AS playbook_action
+        FROM security_events
+        ORDER BY id DESC
+        LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(limit,))
+    except sqlite3.OperationalError:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=8)
+def check_service_health_cached():
+    """
+    Cached health check for both services — refreshes every 8 seconds.
+    Uses fast 1.5s timeouts instead of blocking 5s per service.
+    """
+    client = get_http_client()
+    
+    gateway_healthy = False
+    try:
+        res = client.get(f"{GATEWAY_URL}/health", timeout=1.5)
+        gateway_healthy = res.status_code == 200
     except Exception:
-        return False
+        pass
+    
+    ollama_healthy = False
+    try:
+        res = client.get(f"{OLLAMA_URL}/", timeout=1.5)
+        ollama_healthy = res.status_code == 200
+    except Exception:
+        pass
+    
+    return gateway_healthy, ollama_healthy
+
+
+@st.cache_data(ttl=10)
+def fetch_persistence_data(session_id):
+    """Cached persistence data — avoids HTTP call on every rerun."""
+    client = get_http_client()
+    try:
+        res = client.get(f"{GATEWAY_URL}/attribution/persistence/{session_id}", timeout=2.0)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+
+
+@st.cache_data(ttl=5)
+def fetch_consensus_events(session_id):
+    """Cached consensus events for attribution tab."""
+    conn = get_db_connection()
+    try:
+        df = pd.read_sql_query(
+            "SELECT turn_number, iaa_score, auditor_verdict, auditor_reason, timestamp FROM consensus_events WHERE session_id = ? ORDER BY turn_number DESC",
+            conn,
+            params=(session_id,)
+        )
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
 
 # ================= SIDEBAR =================
 st.sidebar.title("🛡️ Sentinel ATLAS")
 st.sidebar.caption("Real-Time AI Security Operations Gateway")
 
-# System health indicators
-gateway_healthy = check_service_health(f"{GATEWAY_URL}/health")
-ollama_healthy = check_service_health(f"{OLLAMA_URL}/")
+# System health indicators (cached — no blocking on every rerun)
+gateway_healthy, ollama_healthy = check_service_health_cached()
 
 st.sidebar.markdown("### Service Telemetry")
 col_s1, col_s2 = st.sidebar.columns(2)
@@ -224,6 +395,8 @@ else:
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    # Clear all caches to force fresh data
+    st.cache_data.clear()
     st.rerun()
 
 st.sidebar.caption("Threshold: **0.35** (Cosine Similarity)")
@@ -243,8 +416,26 @@ kpi4.metric("Avg Similarity Score", f"{mean_sim:.3f}")
 st.markdown("---")
 
 # ================= MAIN TABS =================
-tab_monitor, tab_audit, tab_attribution, tab_playground = st.tabs([
+ALERT_CARD_TEMPLATE = """
+<div style="border-left:4px solid {colour}; background:#161b22;
+            padding:8px 12px; margin-bottom:6px; border-radius:4px;">
+  <div style="font-size:12px; color:#8b949e;">
+    {icon} <b style="color:{colour};">{action}</b>
+    &nbsp;&middot;&nbsp; {timestamp}
+    &nbsp;&middot;&nbsp; session <code>{session}</code>
+    &nbsp;&middot;&nbsp; risk <b>{risk}</b>
+  </div>
+  <div style="margin:4px 0; color:#e6edf3;">{message}</div>
+  <div style="font-size:12px; color:#8b949e;">
+    <b>{technique}</b> &mdash; {reason}
+  </div>
+</div>
+"""
+
+
+tab_monitor, tab_analytics, tab_audit, tab_attribution, tab_playground = st.tabs([
     "📈 Session Drift Monitor", 
+    "🎯 Attack Analytics",
     "🚨 Security Incidents Audit", 
     "📑 Threat Attribution & AI Reports",
     "🧪 Live Gateway Playground"
@@ -359,7 +550,182 @@ with tab_monitor:
         else:
             st.warning("No records found for this session.")
 
-# ------------- TAB 2: SECURITY AUDIT LOG -------------
+# ------------- TAB 2: ATTACK ANALYTICS (heatmap + live alerts) -------------
+with tab_analytics:
+    matrix_df = fetch_attack_matrix()
+
+    st.subheader("🎯 Attack Type Frequency")
+    st.caption(
+        "Which attack types the gateway flags most often, and how it responded. Combines "
+        "MITRE ATLAS classifier matches with fast-path rule and safety refusals, which "
+        "never reach the classifier but are the majority of interceptions."
+    )
+
+    if matrix_df.empty:
+        st.info(
+            "No classified attacks recorded yet. Send an adversarial prompt through the "
+            "Live Gateway Playground, or run `python tests/test_payloads.py`, and this "
+            "populates within 10 seconds."
+        )
+    else:
+        # Ranked frequency: the direct answer to "which types get flagged most often".
+        freq = (
+            matrix_df.groupby("attack_type")
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=True)
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Attack Types Observed", freq.shape[0])
+        c2.metric("Total Detections", int(freq["count"].sum()))
+        c3.metric("Most Frequent", str(freq.iloc[-1]["attack_type"]).split(" - ")[-1][:22])
+
+        fig_freq = go.Figure(go.Bar(
+            x=freq["count"],
+            y=freq["attack_type"],
+            orientation="h",
+            marker=dict(color=freq["count"], colorscale="Reds", showscale=False),
+            hovertemplate="%{y}<br>Detections: %{x}<extra></extra>",
+        ))
+        fig_freq.update_layout(
+            title="Detections per Attack Type",
+            xaxis_title="Times Flagged",
+            yaxis_title="",
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#2d3342", dtick=1),
+            margin=dict(l=10, r=30, t=60, b=40),
+            height=max(260, 60 + 42 * freq.shape[0]),
+        )
+        st.plotly_chart(fig_freq, use_container_width=True)
+
+        # Heatmap: technique x autonomous playbook response.
+        st.subheader("🔥 Attack Type × Playbook Response Heatmap")
+        st.caption(
+            "How severely each technique is handled. Reading across a row shows whether a "
+            "technique is consistently escalated or split across responses — the signal for "
+            "whether the risk weights are calibrated."
+        )
+
+        ACTION_ORDER = ["allow", "sanitize", "reset", "revoke", "blocked"]
+        pivot = matrix_df.pivot_table(
+            index="attack_type",
+            columns="playbook_action",
+            aggfunc="size",
+            fill_value=0,
+        )
+        pivot = pivot[[a for a in ACTION_ORDER if a in pivot.columns]]
+        pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=True).index]
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=pivot.values,
+            x=[a.upper() for a in pivot.columns],
+            y=list(pivot.index),
+            colorscale="Reds",
+            showscale=True,
+            colorbar=dict(title="Count"),
+            hovertemplate="%{y}<br>Response: %{x}<br>Count: %{z}<extra></extra>",
+            text=pivot.values,
+            texttemplate="%{text}",
+            textfont=dict(size=13),
+            xgap=3,
+            ygap=3,
+        ))
+        fig_heat.update_layout(
+            title="Detections by Attack Type and Autonomous Response",
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(side="top"),
+            margin=dict(l=10, r=30, t=90, b=30),
+            height=max(280, 90 + 52 * pivot.shape[0]),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        # Which gate caught what. Most interceptions never reach the ATLAS
+        # classifier because the rule engine refuses them on the fast path first,
+        # so this is the defence-in-depth view the heatmap alone does not show.
+        by_gate = matrix_df.groupby("detected_by").size().reset_index(name="count")
+        fig_gate = go.Figure(go.Bar(
+            x=by_gate["count"],
+            y=by_gate["detected_by"],
+            orientation="h",
+            marker=dict(color="#58a6ff"),
+            hovertemplate="%{y}<br>Interceptions: %{x}<extra></extra>",
+        ))
+        fig_gate.update_layout(
+            title="Which Gate Caught It",
+            xaxis_title="Interceptions",
+            yaxis_title="",
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#2d3342"),
+            margin=dict(l=10, r=30, t=60, b=40),
+            height=300,
+        )
+        st.plotly_chart(fig_gate, use_container_width=True)
+
+        tactic_df = matrix_df[matrix_df["tactic"].notna()]
+        if not tactic_df.empty:
+            tactics = tactic_df.groupby("tactic").size().reset_index(name="count")
+            fig_tac = go.Figure(go.Bar(
+                x=tactics["tactic"],
+                y=tactics["count"],
+                marker=dict(color="#f85149"),
+                hovertemplate="%{x}<br>Detections: %{y}<extra></extra>",
+            ))
+            fig_tac.update_layout(
+                title="Adversarial Tactics Observed (MITRE ATLAS)",
+                xaxis_title="",
+                yaxis_title="Detections",
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(gridcolor="#2d3342", dtick=1),
+                margin=dict(l=40, r=30, t=60, b=60),
+                height=320,
+            )
+            st.plotly_chart(fig_tac, use_container_width=True)
+
+    st.divider()
+    st.subheader("🔔 Live Alert Feed")
+    st.caption("Most recent interceptions across all sessions. Refreshes every 5 seconds.")
+
+    alerts_df = fetch_live_alerts(25)
+    if alerts_df.empty:
+        st.success("No security interceptions recorded.")
+    else:
+        SEVERITY_STYLE = {
+            "revoke": ("🟥", "#f85149"),
+            "reset": ("🟧", "#db6d28"),
+            "sanitize": ("🟨", "#d29922"),
+            "blocked": ("🟥", "#f85149"),
+            "allow": ("🟩", "#3fb950"),
+        }
+        for _, row in alerts_df.iterrows():
+            action = str(row["playbook_action"] or "blocked")
+            icon, colour = SEVERITY_STYLE.get(action, ("⬜", "#8b949e"))
+            technique = row["attack_technique"] or _label_unclassified(row["reason"])[0]
+            risk = f"{row['risk_score']:.4f}" if pd.notna(row["risk_score"]) else "n/a"
+            st.markdown(
+                ALERT_CARD_TEMPLATE.format(
+                    colour=colour,
+                    icon=icon,
+                    action=action.upper(),
+                    timestamp=row["timestamp"],
+                    session=str(row["session_id"])[:8],
+                    risk=risk,
+                    message=str(row["message_text"])[:150],
+                    technique=technique,
+                    reason=str(row["reason"])[:110],
+                ),
+                unsafe_allow_html=True,
+            )
+
+# ------------- TAB 3: SECURITY AUDIT LOG -------------
 with tab_audit:
     st.subheader("Security Incidents & Adversarial Interception Log")
     st.caption("Historical log of all prompts blocked by the cosine similarity intent guardrail.")
@@ -400,12 +766,8 @@ with tab_attribution:
     if not selected_session:
         st.info("Select a session in the sidebar to view its threat attribution analysis.")
     else:
-        # Fetch persistence and path data via API or DB
-        try:
-            pers_res = requests.get(f"{GATEWAY_URL}/attribution/persistence/{selected_session}", timeout=3.0)
-            persistence_data = pers_res.json() if pers_res.status_code == 200 else {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
-        except Exception:
-            persistence_data = {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+        # Fetch persistence data (cached)
+        persistence_data = fetch_persistence_data(selected_session)
 
         col_p1, col_p2, col_p3 = st.columns(3)
         col_p1.metric("Persistence Streak", f"{persistence_data['max_streak']} Turns", help="Maximum consecutive turns exhibiting semantic drift or security flags.")
@@ -414,19 +776,11 @@ with tab_attribution:
 
         st.markdown("---")
 
-        # Dual-Agent Consensus Events
+        # Dual-Agent Consensus Events (cached)
         st.markdown("### 🤝 Dual-Agent Consensus (ATLAS Bridge)")
         st.caption("Worker Agent proposed action vs. Asynchronous Auditor Agent alignment verdict.")
-        conn = get_db_connection()
-        try:
-            consensus_df = pd.read_sql_query(
-                "SELECT turn_number, iaa_score, auditor_verdict, auditor_reason, timestamp FROM consensus_events WHERE session_id = ? ORDER BY turn_number DESC",
-                conn,
-                params=(selected_session,)
-            )
-        except Exception:
-            consensus_df = pd.DataFrame()
-        conn.close()
+        
+        consensus_df = fetch_consensus_events(selected_session)
 
         if consensus_df.empty:
             st.info("No dual-agent consensus events recorded for this session yet.")
@@ -453,7 +807,8 @@ with tab_attribution:
         if st.button("⚡ Generate AI Threat Attribution Report", key="btn_gen_report", use_container_width=True):
             with st.spinner("Local Ollama analyzing session progression and generating report..."):
                 try:
-                    rep_res = requests.get(f"{GATEWAY_URL}/attribution/report/{selected_session}", timeout=45.0)
+                    client = get_http_client()
+                    rep_res = client.get(f"{GATEWAY_URL}/attribution/report/{selected_session}", timeout=45.0)
                     if rep_res.status_code == 200:
                         report_content = rep_res.json().get("report", "No report generated.")
                         st.session_state[f"report_{selected_session}"] = report_content
@@ -501,7 +856,8 @@ with tab_playground:
             
         try:
             with st.spinner("Evaluating prompt with Sentinel ATLAS..."):
-                resp = requests.post(f"{GATEWAY_URL}/chat", json=payload, timeout=65.0)
+                client = get_http_client()
+                resp = client.post(f"{GATEWAY_URL}/chat", json=payload, timeout=65.0)
                 
             if resp.status_code == 200:
                 data = resp.json()
@@ -524,6 +880,7 @@ with tab_playground:
                 
                 st.json(data)
                 if st.button("🔄 Refresh Timeline to View Turn in Monitor"):
+                    st.cache_data.clear()
                     st.rerun()
             else:
                 st.error(f"Gateway Error: Received HTTP status code {resp.status_code}")

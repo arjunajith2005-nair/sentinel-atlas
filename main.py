@@ -17,7 +17,9 @@ from embeddings.rules import evaluate_security_rules
 from embeddings.safety import check_content_safety
 from session.db import init_db, save_turn, save_blocked_turn, get_session_history, get_security_events
 from session.anchor import compute_intent_anchor
-from intelligence.risk import calculate_composite_risk
+from intelligence.risk import calculate_composite_risk, BLOCKING_ACTIONS
+from intelligence.classifier import classify_threat
+from gateway.agreement import compute_agreement
 from intelligence.bridge import audit_consensus_async, check_next_turn_enforcement
 from intelligence.playbooks import sanitize_context_prompt, execute_session_reset, execute_access_revocation
 from intelligence.attribution import generate_threat_attribution_report, compute_persistence_score
@@ -32,9 +34,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sentinel ATLAS - Security Gateway", lifespan=lifespan)
 
-# Autonomous response risk score tiers from research paper (0.0 to 1.0)
-# <= 0.25: allow, 0.26-0.45: sanitize, 0.46-0.70: reset, > 0.70: revoke
-BLOCK_ON_RISK_LEVELS = {"CRITICAL", "HIGH"}
+# Autonomous response tiers (<= 0.25 allow, 0.26-0.45 sanitize, 0.46-0.70 reset,
+# > 0.70 revoke) are defined once in intelligence/risk.py::RISK_TIERS. This module
+# dispatches on the action that engine recommends — do not re-derive bands here.
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
@@ -140,122 +142,125 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
         window_size=4
     )
     
+    # 3b. Independent MITRE ATLAS classification on EVERY turn.
+    # Deliberately NOT gated on drift detection. Cohen's Kappa in
+    # gateway/agreement.py only means something if the two raters judge the same
+    # turns independently — and a fluent injection that stays semantically close
+    # to the anchor would otherwise never be classified at all. Reuses
+    # message_embedding, so the added cost is one HNSW lookup, not a re-encode.
+    classification = classify_threat(
+        prompt=request.message,
+        distance_threshold=0.45,
+        query_embedding=message_embedding
+    )
+    detector_flag = 1 if drift_result["drift_detected"] else 0
+    classifier_flag = 1 if classification["matched"] else 0
+
     outbound_prompt = request.message
     applied_playbook = "allow"
     risk_info = None
 
-    if drift_result["drift_detected"]:
-        previous_events = get_security_events(session_id)
-        previous_flags = len(previous_events)
-        
-        risk = calculate_composite_risk(
-            drift_score=drift_result["similarity_score"],
-            prompt_text=request.message,
-            turn_number=turn_number,
-            previous_flags=previous_flags,
+    # 4. Composite Risk Scoring — runs on EVERY turn.
+    # Previously this whole block was nested under `if drift_result["drift_detected"]`,
+    # which meant turn 1 of any session was never risk-scored at all: with no history
+    # there is no intent anchor, so drift cannot fire, so no playbook could run. An
+    # attacker only had to open a fresh session. Drift is one weighted input (w1) to
+    # the score, not a precondition for computing it.
+    previous_events = get_security_events(session_id)
+    previous_flags = len(previous_events)
+    
+    risk = calculate_composite_risk(
+        drift_score=drift_result["similarity_score"],
+        prompt_text=request.message,
+        turn_number=turn_number,
+        previous_flags=previous_flags,
+        classification=classification,
+    )
+    risk_info = risk
+    score = risk["risk_score"]
+    action = risk["recommended_action"]
+
+    # MITRE ATLAS classification, carried into every downstream record.
+    # The blocking playbooks return before save_turn (and session reset wipes
+    # session_turns outright), so without this the matched technique would
+    # never be persisted for the heatmaps or weight tuning to read.
+    threat_telemetry = {
+        "risk_score": score,
+        "attack_technique": risk["attack_technique"],
+        "attack_confidence": risk["attack_confidence"],
+        "technique_severity": risk["technique_severity"],
+        "tactic": risk["tactic"],
+        "detector_flag": detector_flag,
+        "classifier_flag": classifier_flag,
+    }
+
+    # 4. Autonomous Response Playbooks (Page 7, Bullet 3).
+    # Dispatch on the action recommended by intelligence/risk.py - the tier
+    # thresholds are defined there and must not be duplicated here.
+    if action in BLOCKING_ACTIONS:
+        playbook = (
+            execute_access_revocation(session_id) if action == "revoke"
+            else execute_session_reset(session_id)
         )
-        risk_info = risk
-        score = risk["risk_score"]
+        save_blocked_turn(
+            session_id=session_id,
+            turn_number=turn_number,
+            message_text=request.message,
+            similarity_score=drift_result["similarity_score"],
+            threshold=0.35,
+            reason=playbook["reason"],
+            playbook_action=action,
+            **threat_telemetry
+        )
+        await auditor.log_event_async(session_id, "vector_drift", {
+            "reason": playbook["reason"],
+            "similarity_score": drift_result["similarity_score"],
+            "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+            "prompt": request.message,
+            "playbook_action": action,
+            **threat_telemetry
+        })
+        log_security_event("vector_drift", session_id, {
+            "reason": playbook["reason"],
+            "similarity_score": drift_result["similarity_score"],
+            "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+            "prompt": request.message,
+            "playbook_action": action,
+            **threat_telemetry
+        })
+        return {
+            "status": "blocked",
+            "reason": playbook["reason"],
+            "session_id": session_id,
+            "turn_number": turn_number,
+            "similarity_score": drift_result["similarity_score"],
+            "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
+            "turns_evaluated": drift_result["window_turns_evaluated"],
+            "gate": "risk_engine",
+            "risk_score": score,
+            "risk_level": risk["risk_level"],
+            "attack_technique": risk["attack_technique"],
+            "playbook_action": action,
+            "detector_flag": detector_flag,
+            "classifier_flag": classifier_flag
+        }
 
-        # 4. Autonomous Response Playbooks (Page 7, Bullet 3)
-        # Score > 0.70: Immediate Access Revocation
-        if score > 0.70:
-            revocation = execute_access_revocation(session_id)
-            save_blocked_turn(
-                session_id=session_id,
-                turn_number=turn_number,
-                message_text=request.message,
-                similarity_score=drift_result["similarity_score"],
-                threshold=0.35,
-                reason=revocation["reason"]
-            )
-            await auditor.log_event_async(session_id, "vector_drift", {
-                "reason": revocation["reason"],
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "prompt": request.message,
-                "detector_flag": 1,
-                "playbook_action": "revoke",
-                "risk_score": score
-            })
-            log_security_event("vector_drift", session_id, {
-                "reason": revocation["reason"],
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "prompt": request.message,
-                "playbook_action": "revoke"
-            })
-            return {
-                "status": "blocked",
-                "reason": revocation["reason"],
-                "session_id": session_id,
-                "turn_number": turn_number,
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "turns_evaluated": drift_result["window_turns_evaluated"],
-                "gate": "risk_engine",
-                "risk_score": score,
-                "playbook_action": "revoke",
-                "detector_flag": 1
-            }
-
-        # Score 0.46 - 0.70: Session Reset (wipe memory, break multi-turn attack)
-        elif score > 0.45:
-            reset_action = execute_session_reset(session_id)
-            save_blocked_turn(
-                session_id=session_id,
-                turn_number=turn_number,
-                message_text=request.message,
-                similarity_score=drift_result["similarity_score"],
-                threshold=0.35,
-                reason=reset_action["reason"]
-            )
-            await auditor.log_event_async(session_id, "vector_drift", {
-                "reason": reset_action["reason"],
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "prompt": request.message,
-                "detector_flag": 1,
-                "playbook_action": "reset",
-                "risk_score": score
-            })
-            log_security_event("vector_drift", session_id, {
-                "reason": reset_action["reason"],
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "prompt": request.message,
-                "playbook_action": "reset"
-            })
-            return {
-                "status": "blocked",
-                "reason": reset_action["reason"],
-                "session_id": session_id,
-                "turn_number": turn_number,
-                "similarity_score": drift_result["similarity_score"],
-                "rolling_avg_similarity": drift_result["rolling_avg_similarity"],
-                "turns_evaluated": drift_result["window_turns_evaluated"],
-                "gate": "risk_engine",
-                "risk_score": score,
-                "playbook_action": "reset",
-                "detector_flag": 1
-            }
-
-        # Score 0.26 - 0.45: Context Sanitisation (clean input, rebuild using core noun phrases)
-        elif score > 0.25:
-            applied_playbook = "sanitize"
-            anchor_text = history[0]["message_text"] if history else request.message
-            outbound_prompt = sanitize_context_prompt(request.message, anchor_text, session_id)
-            await auditor.log_event_async(session_id, "playbook_sanitize", {
-                "original_prompt": request.message,
-                "sanitized_prompt": outbound_prompt,
-                "risk_score": score,
-                "detector_flag": 1
-            })
-            log_security_event("playbook_sanitize", session_id, {
-                "original_prompt": request.message,
-                "sanitized_prompt": outbound_prompt,
-                "risk_score": score
-            })
+    # Context Sanitisation: strip adversarial framing, rebuild from core
+    # noun phrases, then forward the cleaned prompt to the Worker Agent.
+    elif action == "sanitize":
+        applied_playbook = "sanitize"
+        anchor_text = history[0]["message_text"] if history else request.message
+        outbound_prompt = sanitize_context_prompt(request.message, anchor_text, session_id)
+        await auditor.log_event_async(session_id, "playbook_sanitize", {
+            "original_prompt": request.message,
+            "sanitized_prompt": outbound_prompt,
+            **threat_telemetry
+        })
+        log_security_event("playbook_sanitize", session_id, {
+            "original_prompt": request.message,
+            "sanitized_prompt": outbound_prompt,
+            **threat_telemetry
+        })
 
     # 5. Forward to Worker Agent (Zero latency penalty to user)
     llm_response = await forward_to_llm(outbound_prompt)
@@ -283,8 +288,11 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
         llm_response=llm_response,
         drift_score=drift_result["similarity_score"],
         risk_score=risk_info["risk_score"] if risk_info else None,
-        attack_technique=risk_info.get("attack_technique") if risk_info else None,
-        attack_confidence=risk_info.get("attack_confidence") if risk_info else None
+        attack_technique=risk_info.get("attack_technique") if risk_info else classification["attack_technique"],
+        attack_confidence=risk_info.get("attack_confidence") if risk_info else classification["attack_confidence"],
+        detector_flag=detector_flag,
+        classifier_flag=classifier_flag,
+        playbook_action=applied_playbook
     )
 
     # 6. ATLAS Bridge: Asynchronous Auditor Agent Consensus Check in Background
@@ -309,9 +317,21 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
         "gate": "passed",
         "playbook_action": applied_playbook,
         "sanitized": (applied_playbook == "sanitize"),
-        "detector_flag": 0,
+        "detector_flag": detector_flag,
+        "classifier_flag": classifier_flag,
+        "attack_technique": classification["attack_technique"],
         "llm_response": llm_response
     }
+
+
+@app.get("/metrics/agreement")
+async def get_agreement_metrics(session_id: Optional[str] = None):
+    """
+    Inter-rater agreement (Cohen's Kappa) between Person B's drift detector and
+    Person C's MITRE ATLAS classifier. Omit session_id for the whole corpus.
+    Feeds Phase 5 weight tuning.
+    """
+    return compute_agreement(session_id)
 
 
 @app.get("/attribution/report/{session_id}")

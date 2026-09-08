@@ -129,13 +129,41 @@ check("Score 0.40 maps to MEDIUM / sanitize", level_med == "MEDIUM" and act_med 
 level_low, act_low = determine_risk_tier(0.20)
 check("Score 0.20 maps to LOW / allow", level_low == "LOW" and act_low == "allow")
 
-# Boundary conditions
-check("Boundary 0.85 maps to CRITICAL / revoke", determine_risk_tier(0.85) == ("CRITICAL", "revoke"))
-check("Boundary 0.8499 maps to HIGH / reset", determine_risk_tier(0.8499) == ("HIGH", "reset"))
-check("Boundary 0.60 maps to HIGH / reset", determine_risk_tier(0.60) == ("HIGH", "reset"))
-check("Boundary 0.5999 maps to MEDIUM / sanitize", determine_risk_tier(0.5999) == ("MEDIUM", "sanitize"))
-check("Boundary 0.35 maps to MEDIUM / sanitize", determine_risk_tier(0.35) == ("MEDIUM", "sanitize"))
-check("Boundary 0.3499 maps to LOW / allow", determine_risk_tier(0.3499) == ("LOW", "allow"))
+# Boundary conditions — bands are exclusive lower bounds per the research paper
+# (<= 0.25 allow, 0.26-0.45 sanitize, 0.46-0.70 reset, > 0.70 revoke), so a score
+# sitting exactly on a bound belongs to the LOWER tier.
+check("Boundary 0.7001 maps to CRITICAL / revoke", determine_risk_tier(0.7001) == ("CRITICAL", "revoke"))
+check("Boundary 0.70 maps to HIGH / reset", determine_risk_tier(0.70) == ("HIGH", "reset"))
+check("Boundary 0.4501 maps to HIGH / reset", determine_risk_tier(0.4501) == ("HIGH", "reset"))
+check("Boundary 0.45 maps to MEDIUM / sanitize", determine_risk_tier(0.45) == ("MEDIUM", "sanitize"))
+check("Boundary 0.2501 maps to MEDIUM / sanitize", determine_risk_tier(0.2501) == ("MEDIUM", "sanitize"))
+check("Boundary 0.25 maps to LOW / allow", determine_risk_tier(0.25) == ("LOW", "allow"))
+
+# -------------------------------------------------------------
+print("")
+print("🧪 TEST 4b: Weight Invariants (guards against a bad retune)")
+# -------------------------------------------------------------
+_w1, _w2 = DEFAULT_WEIGHTS["w1"], DEFAULT_WEIGHTS["w2"]
+_w3, _w4 = DEFAULT_WEIGHTS["w3"], DEFAULT_WEIGHTS["w4"]
+
+check("Weights sum to 1.0", abs((_w1 + _w2 + _w3 + _w4) - 1.0) < 1e-9)
+
+# Invariant 1: drift must be ABLE to act on its own. At w1 = 0.20 its maximum
+# possible contribution (0.20) sat below the lowest action threshold (0.25), so
+# no amount of topic drift could ever trigger a playbook.
+check("Maximum drift alone reaches an action (w1 > 0.25)",
+      determine_risk_tier(_w1)[1] != "allow")
+check("Maximum drift alone is exactly 'sanitize', never harsher",
+      determine_risk_tier(_w1) == ("MEDIUM", "sanitize"))
+
+# Invariant 2: drift + repeat-offender history, with zero attack evidence, must
+# not be able to destroy a session. Only MITRE ATLAS match evidence may do that.
+check("Drift + history combined cannot exceed sanitize (w1 + w4 <= 0.45)",
+      determine_risk_tier(_w1 + _w4) == ("MEDIUM", "sanitize"))
+
+# The attack factors must still be able to reach the top tier.
+check("Attack evidence can still reach revoke",
+      determine_risk_tier(_w1 + _w2 + _w3)[1] == "revoke")
 
 # -------------------------------------------------------------
 print("\n🧪 TEST 5: Composite Risk Engine End-to-End (`calculate_composite_risk`)")
@@ -172,7 +200,7 @@ risk_attack = calculate_composite_risk(
     previous_flags=0
 )
 check("Attack prompt detected as matched", risk_attack["matched"] is True)
-check("Attack score >= 0.60", risk_attack["risk_score"] >= 0.60)
+check("Attack score clears the HIGH/reset boundary (> 0.45)", risk_attack["risk_score"] > 0.45)
 check("Attack level is HIGH", risk_attack["risk_level"] == "HIGH")
 check("Attack action is reset", risk_attack["recommended_action"] == "reset")
 check("Technique ID is populated (AML.T0051)", "T0051" in (risk_attack["technique_id"] or ""))
@@ -185,7 +213,7 @@ risk_critical = calculate_composite_risk(
     turn_number=4,
     previous_flags=2
 )
-check("Critical repeat attack score >= 0.85", risk_critical["risk_score"] >= 0.85)
+check("Critical repeat attack clears the CRITICAL/revoke boundary (> 0.70)", risk_critical["risk_score"] > 0.70)
 check("Critical level is CRITICAL", risk_critical["risk_level"] == "CRITICAL")
 check("Critical action is revoke", risk_critical["recommended_action"] == "revoke")
 print(f"     -> Critical Score: {risk_critical['risk_score']} | Level: {risk_critical['risk_level']} | Action: {risk_critical['recommended_action']}")
@@ -199,6 +227,19 @@ risk_custom = calculate_composite_risk(
     previous_flags=0,
     weights=custom_weights
 )
+# Regression guard: severity must be weighted by match confidence, per the
+# documented formula. Applying raw severity let marginal matches score as highly
+# as certain ones, pushing benign prompts to CRITICAL.
+_w = risk_attack["weights"]
+_expected_severity_component = round(
+    _w["w3"] * risk_attack["technique_severity"] * risk_attack["attack_confidence"], 4
+)
+check("Severity component is scaled by match confidence",
+      abs(risk_attack["components"]["severity_component"] - _expected_severity_component) < 1e-4)
+check("Severity component is strictly below raw w3*severity for a sub-1.0 confidence",
+      risk_attack["attack_confidence"] < 1.0 and
+      risk_attack["components"]["severity_component"] < _w["w3"] * risk_attack["technique_severity"])
+
 check("Custom weights honored", risk_custom["weights"]["w1"] == 0.50)
 check("Normalized score bounded in [0.0, 1.0]", 0.0 <= risk_custom["risk_score"] <= 1.0)
 

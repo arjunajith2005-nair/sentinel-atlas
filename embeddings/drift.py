@@ -20,10 +20,15 @@ def check_intent_drift(
     the moving window average across up to the last 4 turns.
     """
     if not anchor_vec:
+        # No anchor yet (turn 1, or a deferred anchor awaiting a substantive turn).
+        # Must return the same keys as the scored path below — callers read
+        # window_turns_evaluated unconditionally, and the risk engine now runs on
+        # turn 1, so this branch is reachable from the blocking playbooks.
         return {
-            "drift_detected": False, 
-            "similarity_score": 1.0, 
+            "drift_detected": False,
+            "similarity_score": 1.0,
             "rolling_avg_similarity": 1.0,
+            "window_turns_evaluated": 0,
             "threshold": threshold
         }
     

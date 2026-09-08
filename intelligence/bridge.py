@@ -11,8 +11,11 @@ Implements Page 6, Bullet 2 of the research paper:
 import httpx
 import numpy as np
 import logging
-from typing import Dict, Optional, List
+import re
+from typing import Dict, Optional, List, Tuple
 from embeddings.encoder import get_embedding
+from embeddings.drift import calculate_cosine_similarity
+from embeddings.auditor import calculate_iaa_score
 from session.db import save_consensus_event, get_pending_consensus_alert, mark_consensus_enforced
 from gateway.logger import log_security_event
 
@@ -20,29 +23,68 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 AUDITOR_MODEL = "smollm:135m"
 IAA_THRESHOLD = 0.35  # Cosine similarity threshold between Intent Anchor and Response
 
-def compute_cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Computes cosine similarity in range [-1.0, 1.0]."""
-    if not vec1 or not vec2:
-        return 1.0
-    a = np.array(vec1, dtype=np.float32)
-    b = np.array(vec2, dtype=np.float32)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+# Intent-Action Alignment is defined once, in embeddings/auditor.py, and re-exported
+# here so both the Auditor Agent and this Bridge score alignment identically.
+#
+# Do not confuse this with Inter-Rater Agreement in gateway/agreement.py: that one
+# is Cohen's Kappa between the drift detector and the ATLAS classifier across the
+# whole corpus. This one is per-turn cosine between anchor and response.
+compute_cosine_similarity = calculate_cosine_similarity
+
+# The Auditor is asked to reply with a single line: "ALIGNED: <reason>" or
+# "MISALIGNED: <reason>". The verdict is only accepted as the LEADING token of
+# the reply, after optional markdown/quoting/"Verdict:" noise.
+_VERDICT_PREFIX = re.compile(r"^\s*(?:\**\s*verdict\s*\**\s*[:\-]?\s*)?", re.IGNORECASE)
+_VERDICT_TOKEN = re.compile(
+    r"^[\s\"'`*_>#\[\(]*(?P<verdict>MIS[\s_-]*ALIGNED|ALIGNED)\b[\s\"'`*_\]\)]*[:\-–]?\s*(?P<reason>.*)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-def calculate_iaa_score(intent_anchor_vec: List[float], response_text: str) -> float:
+def parse_auditor_verdict(raw_response: str) -> Tuple[str, str]:
     """
-    Calculates the Intent-Action Alignment (IAA) score by measuring cosine similarity
-    between the original intent vector and the proposed response vector.
+    Parses the Auditor Agent's reply into (verdict, reason).
+
+    verdict is one of "ALIGNED", "MISALIGNED", or "UNPARSEABLE".
+
+    This deliberately does NOT substring-search the reply. The previous
+    implementation flagged MISALIGNED whenever the text contained "MISALIGNED",
+    "JAILBREAK" or "ATTACK" anywhere — unworkable for a security assistant,
+    where those words appear routinely in correct answers, and where a small
+    auditor model often ignores the format and emits prose or code instead of a
+    verdict. Both produced false MISALIGNED verdicts that blocked the user's
+    NEXT turn, making the block look unrelated to its cause.
+
+    An unreadable reply returns "UNPARSEABLE" rather than a verdict. The caller
+    decides what to do with that; it is not by itself evidence of misalignment.
     """
-    if not intent_anchor_vec or not response_text:
-        return 1.0
-    response_vec = get_embedding(response_text)
-    sim = compute_cosine_similarity(intent_anchor_vec, response_vec)
-    return round(float(sim), 4)
+    if not raw_response or not raw_response.strip():
+        return "UNPARSEABLE", "Auditor returned an empty response."
+
+    # Consider only the first non-empty line — the prompt asks for exactly one.
+    first_line = ""
+    for line in raw_response.strip().splitlines():
+        if line.strip():
+            first_line = line.strip()
+            break
+
+    candidate = _VERDICT_PREFIX.sub("", first_line, count=1)
+    match = _VERDICT_TOKEN.match(candidate)
+    if not match:
+        snippet = " ".join(raw_response.split())[:120]
+        return "UNPARSEABLE", f"Auditor reply did not begin with a verdict: {snippet}"
+
+    token = re.sub(r"[\s_-]+", "", match.group("verdict")).upper()
+    verdict = "MISALIGNED" if token == "MISALIGNED" else "ALIGNED"
+    reason = match.group("reason").strip()[:150]
+
+    if not reason:
+        reason = (
+            "Mismatch between intent and action detected."
+            if verdict == "MISALIGNED"
+            else "Action evaluated as safe and aligned with expected intent."
+        )
+    return verdict, reason
 
 
 async def audit_consensus_async(
@@ -89,26 +131,33 @@ async def audit_consensus_async(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(OLLAMA_URL, json=payload)
             if resp.status_code == 200:
-                raw = resp.json().get("response", "").strip()
-                upper_raw = raw.upper()
-                
-                # Check for explicit misalignment or security alert in the auditor output
-                if "MISALIGNED" in upper_raw or "JAILBREAK" in upper_raw or "ATTACK" in upper_raw:
-                    auditor_verdict = "MISALIGNED"
-                    auditor_reason = raw[:150].strip() or "Mismatch between intent and action detected."
-                else:
-                    auditor_verdict = "ALIGNED"
-                    auditor_reason = "Action evaluated as safe and aligned with expected intent."
+                raw = resp.json().get("response", "")
+                auditor_verdict, auditor_reason = parse_auditor_verdict(raw)
+            else:
+                auditor_verdict = "UNPARSEABLE"
+                auditor_reason = f"Auditor HTTP {resp.status_code}"
     except Exception as e:
+        auditor_verdict = "UNPARSEABLE"
         auditor_reason = f"Auditor failover: {e}"
 
-    # Only flag consensus alert if Auditor explicitly flagged MISALIGNED
-    # or if an established substantive anchor exists and IAA score is critically low (< 0.15) without alignment
+    # Flag a consensus alert only on an explicit MISALIGNED verdict.
+    #
+    # When no usable second opinion came back (unparseable reply, HTTP error, or
+    # Ollama offline), fall back to the mathematical signal alone and only at a
+    # critically low alignment — an auditor that failed to answer is not evidence
+    # of an attack, and this verdict blocks the user's next turn.
     has_substantive_prompt = len(user_prompt.strip().split()) >= 6
-    is_mismatch = (auditor_verdict == "MISALIGNED") or (
-        bool(intent_anchor_vec) and has_substantive_prompt and iaa_score < 0.15 and auditor_verdict != "ALIGNED"
-    )
-    
+    if auditor_verdict == "MISALIGNED":
+        is_mismatch = True
+    elif auditor_verdict == "UNPARSEABLE":
+        is_mismatch = (
+            bool(intent_anchor_vec)
+            and has_substantive_prompt
+            and iaa_score < 0.15
+        )
+    else:
+        is_mismatch = False
+
     save_consensus_event(
         session_id=session_id,
         turn_number=turn_number,

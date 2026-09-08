@@ -103,27 +103,35 @@ def build_atlas_index(force_rebuild: bool = False) -> int:
     
     return collection.count()
 
-def match_atlas_technique(prompt: str, top_k: int = 3, distance_threshold: float = 0.58) -> Dict:
+def match_atlas_technique(
+    prompt: str,
+    top_k: int = 3,
+    distance_threshold: float = 0.58,
+    query_embedding: Optional[List[float]] = None
+) -> Dict:
     """
     Semantically searches the MITRE ATLAS index for closest attack pattern matches.
-    
+
     Args:
         prompt: User message / suspicious query to classify.
         top_k: Number of candidate techniques to retrieve.
-        distance_threshold: Maximum cosine distance to qualify as an attack match 
+        distance_threshold: Maximum cosine distance to qualify as an attack match
                             (Distance 0.58 = Similarity 0.42).
-                            
+        query_embedding: Optional precomputed embedding of `prompt`. The gateway
+                         already embeds every message for drift scoring, so passing
+                         it here avoids a redundant second encode on the hot path.
+
     Returns:
         Structured match dictionary with confidence and sensitivity scores.
     """
     collection = get_atlas_collection()
-    
+
     # Check if index needs building
     if collection.count() == 0:
         build_atlas_index()
-        
-    query_emb = get_embedding(prompt)
-    
+
+    query_emb = query_embedding if query_embedding else get_embedding(prompt)
+
     results = collection.query(
         query_embeddings=[query_emb],
         n_results=top_k,

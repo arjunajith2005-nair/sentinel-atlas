@@ -44,11 +44,22 @@ def check(name, condition):
 
 
 # ══════════════════════════════════════════
-print("\n🧪 TEST 1: Schema has all 11 columns")
+print("\n🧪 TEST 1: Schema has every required column")
 # ══════════════════════════════════════════
 init_db()
 cols = count_columns()
-check("Total column count is 13", len(cols) == 13)
+# Assert on required columns rather than an exact count — the count changes
+# every time the schema is extended, which made this test brittle.
+REQUIRED_COLUMNS = {
+    "id", "session_id", "turn_number", "message_text", "embedding",
+    "similarity_score", "llm_response", "drift_score", "risk_score",
+    "attack_technique", "attack_confidence", "false_positive",
+    "detector_flag", "classifier_flag", "timestamp",
+}
+missing = REQUIRED_COLUMNS - set(cols)
+check(f"No required columns missing (have {len(cols)})", not missing)
+if missing:
+    print(f"     -> missing: {sorted(missing)}")
 check("drift_score exists",       "drift_score" in cols)
 check("risk_score exists",        "risk_score" in cols)
 check("attack_technique exists",  "attack_technique" in cols)

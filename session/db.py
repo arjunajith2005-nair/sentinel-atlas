@@ -28,11 +28,17 @@ def init_db():
             attack_technique TEXT DEFAULT NULL,
             attack_confidence REAL DEFAULT NULL,
             false_positive INTEGER DEFAULT 0,
+            detector_flag INTEGER DEFAULT NULL,
+            classifier_flag INTEGER DEFAULT NULL,
+            playbook_action TEXT DEFAULT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Security events table for tracking blocked prompts and drift incidents
+    # Security events table for tracking blocked prompts and drift incidents.
+    # This table is the forensic record of record: unlike session_turns, it is
+    # NOT wiped by the session-reset playbook, so it carries the MITRE ATLAS
+    # classification for every intercepted attack.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS security_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +48,15 @@ def init_db():
             similarity_score REAL NOT NULL,
             threshold REAL NOT NULL,
             reason TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            risk_score REAL DEFAULT NULL,
+            attack_technique TEXT DEFAULT NULL,
+            attack_confidence REAL DEFAULT NULL,
+            technique_severity REAL DEFAULT NULL,
+            tactic TEXT DEFAULT NULL,
+            playbook_action TEXT DEFAULT NULL,
+            detector_flag INTEGER DEFAULT NULL,
+            classifier_flag INTEGER DEFAULT NULL
         )
     """)
 
@@ -69,31 +83,48 @@ def init_db():
 
 def upgrade_schema():
     """
-    Adds new columns to an existing session_turns table if they don't exist.
-    Safe to run multiple times — skips columns that are already present.
+    Adds new columns to existing session_turns / security_events tables if they
+    don't exist. Safe to run multiple times — skips columns already present.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Check which columns already exist
-    cursor.execute("PRAGMA table_info(session_turns)")
-    existing_columns = {row[1] for row in cursor.fetchall()}
+    table_columns = {
+        "session_turns": [
+            ("similarity_score", "REAL DEFAULT 1.0"),
+            ("llm_response", "TEXT DEFAULT ''"),
+            ("drift_score", "REAL DEFAULT NULL"),
+            ("risk_score", "REAL DEFAULT NULL"),
+            ("attack_technique", "TEXT DEFAULT NULL"),
+            ("attack_confidence", "REAL DEFAULT NULL"),
+            ("false_positive", "INTEGER DEFAULT 0"),
+            ("detector_flag", "INTEGER DEFAULT NULL"),
+            ("classifier_flag", "INTEGER DEFAULT NULL"),
+            ("playbook_action", "TEXT DEFAULT NULL"),
+        ],
+        "security_events": [
+            ("risk_score", "REAL DEFAULT NULL"),
+            ("attack_technique", "TEXT DEFAULT NULL"),
+            ("attack_confidence", "REAL DEFAULT NULL"),
+            ("technique_severity", "REAL DEFAULT NULL"),
+            ("tactic", "TEXT DEFAULT NULL"),
+            ("playbook_action", "TEXT DEFAULT NULL"),
+            ("detector_flag", "INTEGER DEFAULT NULL"),
+            ("classifier_flag", "INTEGER DEFAULT NULL"),
+        ],
+    }
 
-    new_columns = [
-        ("similarity_score", "REAL DEFAULT 1.0"),
-        ("llm_response", "TEXT DEFAULT ''"),
-        ("drift_score", "REAL DEFAULT NULL"),
-        ("risk_score", "REAL DEFAULT NULL"),
-        ("attack_technique", "TEXT DEFAULT NULL"),
-        ("attack_confidence", "REAL DEFAULT NULL"),
-        ("false_positive", "INTEGER DEFAULT 0"),
-    ]
+    for table, new_columns in table_columns.items():
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if not existing_columns:
+            continue  # Table doesn't exist yet; init_db() creates it in full
 
-    for col_name, col_type in new_columns:
-        if col_name not in existing_columns:
-            cursor.execute(
-                f"ALTER TABLE session_turns ADD COLUMN {col_name} {col_type}"
-            )
+        for col_name, col_type in new_columns:
+            if col_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"
+                )
 
     conn.commit()
     conn.close()
@@ -110,10 +141,18 @@ def save_turn(
     risk_score: float | None = None,
     attack_technique: str | None = None,
     attack_confidence: float | None = None,
+    detector_flag: int | None = None,
+    classifier_flag: int | None = None,
+    playbook_action: str | None = None,
 ):
     """
     Saves a conversation turn with its vector embedding, similarity score,
     LLM response, and optional security scores.
+
+    detector_flag / classifier_flag are the two independent binary verdicts
+    (drift detector vs MITRE ATLAS classifier) used to compute inter-rater
+    agreement in gateway/agreement.py. Store them on EVERY turn, flagged or not
+    — Cohen's Kappa needs the agreed-negative cases too.
     Backward-compatible: existing callers can omit the new parameters.
     """
     conn = sqlite3.connect(DB_PATH)
@@ -125,28 +164,60 @@ def save_turn(
         INSERT INTO session_turns
             (session_id, turn_number, message_text, embedding,
              similarity_score, llm_response,
-             drift_score, risk_score, attack_technique, attack_confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             drift_score, risk_score, attack_technique, attack_confidence,
+             detector_flag, classifier_flag, playbook_action)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         session_id, turn_number, message_text, embedding_json,
         similarity_score, llm_response,
         drift_score, risk_score, attack_technique, attack_confidence,
+        detector_flag, classifier_flag, playbook_action,
     ))
 
     conn.commit()
     conn.close()
 
 
-def save_blocked_turn(session_id: str, turn_number: int, message_text: str, similarity_score: float, threshold: float = 0.35, reason: str = "Intent drift detected"):
+def save_blocked_turn(
+    session_id: str,
+    turn_number: int,
+    message_text: str,
+    similarity_score: float,
+    threshold: float = 0.35,
+    reason: str = "Intent drift detected",
+    risk_score: float | None = None,
+    attack_technique: str | None = None,
+    attack_confidence: float | None = None,
+    technique_severity: float | None = None,
+    tactic: str | None = None,
+    playbook_action: str | None = None,
+    detector_flag: int | None = None,
+    classifier_flag: int | None = None,
+):
     """
-    Logs an intercepted/blocked attempt to the security_events audit table.
+    Logs an intercepted/blocked attempt to the security_events audit table,
+    together with the MITRE ATLAS classification that triggered the block.
+
+    The risk/technique fields are recorded here rather than on session_turns
+    because the session-reset playbook wipes session_turns — this table is what
+    survives, and what the technique heatmaps and weight tuning read from.
+    Backward-compatible: existing callers can omit the new parameters.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO security_events (session_id, turn_number, message_text, similarity_score, threshold, reason)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (session_id, turn_number, message_text, similarity_score, threshold, reason))
+        INSERT INTO security_events
+            (session_id, turn_number, message_text, similarity_score, threshold, reason,
+             risk_score, attack_technique, attack_confidence,
+             technique_severity, tactic, playbook_action,
+             detector_flag, classifier_flag)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        session_id, turn_number, message_text, similarity_score, threshold, reason,
+        risk_score, attack_technique, attack_confidence,
+        technique_severity, tactic, playbook_action,
+        detector_flag, classifier_flag,
+    ))
     conn.commit()
     conn.close()
 
@@ -226,7 +297,8 @@ def get_session_history(session_id: str):
     cursor.execute("""
         SELECT turn_number, message_text, embedding,
                drift_score, risk_score, attack_technique,
-               attack_confidence, false_positive
+               attack_confidence, false_positive,
+               detector_flag, classifier_flag
         FROM session_turns
         WHERE session_id = ? ORDER BY turn_number ASC
     """, (session_id,))
@@ -235,7 +307,7 @@ def get_session_history(session_id: str):
 
     history = []
     for (turn_num, text, emb_str, drift, risk,
-         technique, confidence, fp) in rows:
+         technique, confidence, fp, det_flag, cls_flag) in rows:
         history.append({
             "turn_number": turn_num,
             "message_text": text,
@@ -245,6 +317,8 @@ def get_session_history(session_id: str):
             "attack_technique": technique,
             "attack_confidence": confidence,
             "false_positive": bool(fp),
+            "detector_flag": det_flag,
+            "classifier_flag": cls_flag,
         })
     return history
 
@@ -269,17 +343,25 @@ def get_all_sessions():
 def get_security_events(session_id: str = None):
     """
     Retrieves security incidents, optionally filtered by session_id.
+
+    Note: the risk/technique columns are appended after `timestamp` so that
+    callers indexing rows positionally (ev[0]..ev[7]) keep working unchanged.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    columns = """
+        id, session_id, turn_number, message_text, similarity_score, threshold, reason, timestamp,
+        risk_score, attack_technique, attack_confidence, technique_severity, tactic, playbook_action,
+        detector_flag, classifier_flag
+    """
     if session_id:
-        cursor.execute("""
-            SELECT id, session_id, turn_number, message_text, similarity_score, threshold, reason, timestamp
+        cursor.execute(f"""
+            SELECT {columns}
             FROM security_events WHERE session_id = ? ORDER BY timestamp DESC
         """, (session_id,))
     else:
-        cursor.execute("""
-            SELECT id, session_id, turn_number, message_text, similarity_score, threshold, reason, timestamp
+        cursor.execute(f"""
+            SELECT {columns}
             FROM security_events ORDER BY timestamp DESC
         """)
     rows = cursor.fetchall()
