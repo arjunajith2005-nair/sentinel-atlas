@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import sqlite3
 import requests
 import os
@@ -9,29 +10,29 @@ from datetime import datetime
 
 # Set page configuration
 st.set_page_config(
-    page_title="Sentinel ATLAS | Operations Center",
+    page_title="Sentinel ATLAS | SOC Operations Center",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Resolve database path relative to workspace
+# Resolve paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DB_PATH = os.path.join(BASE_DIR, "sentinel_sessions.db")
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8001")
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
 # Custom CSS for dark cybersecurity dashboard aesthetic
 st.markdown("""
 <style>
     .metric-card {
-        background-color: #1e222d;
-        border: 1px solid #2d3342;
+        background-color: #161b22;
+        border: 1px solid #30363d;
         border-radius: 8px;
-        padding: 16px;
+        padding: 14px;
         margin-bottom: 12px;
     }
-    .badge-success {
+    .badge-allow {
         background-color: #0e4429;
         color: #3fb950;
         padding: 4px 8px;
@@ -39,7 +40,23 @@ st.markdown("""
         font-weight: 600;
         font-size: 12px;
     }
-    .badge-blocked {
+    .badge-sanitize {
+        background-color: #4d3800;
+        color: #d29922;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 12px;
+    }
+    .badge-reset {
+        background-color: #5a1e02;
+        color: #f0883e;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 12px;
+    }
+    .badge-revoke {
         background-color: #490202;
         color: #f85149;
         padding: 4px 8px;
@@ -68,111 +85,147 @@ st.markdown("""
         border-radius: 6px;
         margin-bottom: 16px;
     }
+    .trajectory-step {
+        background-color: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
+
 
 def get_db_connection():
     return sqlite3.connect(DB_PATH, timeout=10)
 
+
 def fetch_overview_metrics():
+    """Fetches top-level KPIs per Section 22."""
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Total sessions
-    c.execute("SELECT COUNT(DISTINCT session_id) FROM session_turns")
-    total_sessions = c.fetchone()[0] or 0
-    
-    # Total valid turns
-    c.execute("SELECT COUNT(*) FROM session_turns")
-    total_turns = c.fetchone()[0] or 0
-    
-    # Average similarity score (if available)
+    # Active Sessions
     try:
-        c.execute("SELECT AVG(similarity_score) FROM session_turns WHERE similarity_score IS NOT NULL")
-        avg_score = c.fetchone()[0]
-        avg_score = round(avg_score, 3) if avg_score else 1.0
-    except sqlite3.OperationalError:
-        avg_score = 1.0
-        
-    # Blocked incidents
-    try:
-        c.execute("SELECT COUNT(*) FROM security_events")
-        blocked_count = c.fetchone()[0] or 0
-    except sqlite3.OperationalError:
-        blocked_count = 0
-        
-    conn.close()
-    return total_sessions, total_turns, blocked_count, avg_score
+        c.execute("SELECT COUNT(*) FROM sessions WHERE status = 'ACTIVE'")
+        active_sessions = c.fetchone()[0] or 0
+    except Exception:
+        active_sessions = 0
 
-def fetch_all_sessions():
+    # Total Requests
+    try:
+        c.execute("SELECT COUNT(*) FROM session_turns")
+        total_requests = c.fetchone()[0] or 0
+    except Exception:
+        total_requests = 0
+
+    # Active Threats (Score > 25)
+    try:
+        c.execute("SELECT COUNT(*) FROM session_turns WHERE risk_score > 25")
+        active_threats = c.fetchone()[0] or 0
+    except Exception:
+        active_threats = 0
+
+    # Critical Threats (Score >= 71)
+    try:
+        c.execute("SELECT COUNT(*) FROM session_turns WHERE risk_score >= 71")
+        critical_threats = c.fetchone()[0] or 0
+    except Exception:
+        critical_threats = 0
+
+    # Average Risk
+    try:
+        c.execute("SELECT AVG(risk_score) FROM session_turns WHERE risk_score IS NOT NULL")
+        avg_risk = c.fetchone()[0]
+        avg_risk = round(avg_risk, 1) if avg_risk is not None else 0.0
+    except Exception:
+        avg_risk = 0.0
+
+    # Blocked Sessions (Status = 'REVOKED')
+    try:
+        c.execute("SELECT COUNT(*) FROM sessions WHERE status = 'REVOKED'")
+        blocked_sessions = c.fetchone()[0] or 0
+    except Exception:
+        blocked_sessions = 0
+
+    conn.close()
+    return active_sessions, total_requests, active_threats, critical_threats, avg_risk, blocked_sessions
+
+
+def fetch_all_sessions_df():
     conn = get_db_connection()
     query = """
     SELECT 
         s.session_id, 
-        COUNT(s.id) as valid_turns, 
-        MAX(s.timestamp) as last_seen
-    FROM session_turns s
+        COUNT(t.id) as valid_turns, 
+        COALESCE(s.status, 'ACTIVE') as status,
+        COALESCE(s.session_risk, 0.0) as session_risk,
+        MAX(t.timestamp) as last_seen
+    FROM session_turns t
+    LEFT JOIN sessions s ON t.session_id = s.session_id
     GROUP BY s.session_id
     ORDER BY last_seen DESC
     """
-    df = pd.read_sql_query(query, conn)
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        df = pd.DataFrame()
     conn.close()
     return df
 
-def fetch_session_timeline(session_id):
+
+def fetch_session_turns_df(session_id):
     conn = get_db_connection()
-    
-    # Valid turns
-    turns_query = """
+    query = """
     SELECT 
         turn_number, 
         message_text, 
         COALESCE(similarity_score, 1.0) as similarity_score,
+        COALESCE(drift_score, 0.0) as drift_score,
+        COALESCE(risk_score, 0.0) as risk_score,
+        COALESCE(attack_technique, 'None') as attack_technique,
+        COALESCE(attack_confidence, 0.0) as attack_confidence,
+        COALESCE(topic_id, 'General') as topic_id,
         COALESCE(llm_response, '') as llm_response,
-        'success' as status,
         timestamp
     FROM session_turns
     WHERE session_id = ?
+    ORDER BY turn_number ASC
     """
-    df_turns = pd.read_sql_query(turns_query, conn, params=(session_id,))
-    
-    # Blocked incidents for this session
     try:
-        events_query = """
-        SELECT 
-            turn_number, 
-            message_text, 
-            similarity_score, 
-            reason as llm_response,
-            'blocked' as status,
-            timestamp
-        FROM security_events
-        WHERE session_id = ?
-        """
-        df_blocked = pd.read_sql_query(events_query, conn, params=(session_id,))
-    except sqlite3.OperationalError:
-        df_blocked = pd.DataFrame()
-        
-    conn.close()
-    
-    combined = pd.concat([df_turns, df_blocked], ignore_index=True)
-    if not combined.empty:
-        combined = combined.sort_values(by=["turn_number", "timestamp"]).reset_index(drop=True)
-    return combined
-
-def fetch_all_security_events():
-    conn = get_db_connection()
-    try:
-        query = """
-        SELECT id, session_id, turn_number, message_text, similarity_score, threshold, reason, timestamp
-        FROM security_events
-        ORDER BY timestamp DESC
-        """
-        df = pd.read_sql_query(query, conn)
-    except sqlite3.OperationalError:
+        df = pd.read_sql_query(query, conn, params=(session_id,))
+    except Exception:
         df = pd.DataFrame()
     conn.close()
     return df
+
+
+def fetch_session_topics_df(session_id):
+    conn = get_db_connection()
+    try:
+        query = "SELECT topic_id, topic_name, first_turn, last_turn, is_benign, created_at FROM topics WHERE session_id = ? ORDER BY first_turn ASC"
+        df = pd.read_sql_query(query, conn, params=(session_id,))
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+def fetch_atlas_frequency_df():
+    conn = get_db_connection()
+    try:
+        query = """
+        SELECT technique_id, technique_name, COUNT(*) as occurrences, AVG(confidence) as avg_confidence
+        FROM atlas_matches
+        GROUP BY technique_id, technique_name
+        ORDER BY occurrences DESC
+        """
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
 
 def check_service_health(url):
     try:
@@ -181,22 +234,23 @@ def check_service_health(url):
     except Exception:
         return False
 
+
 # ================= SIDEBAR =================
 st.sidebar.title("🛡️ Sentinel ATLAS")
-st.sidebar.caption("Real-Time AI Security Operations Gateway")
+st.sidebar.caption("Stateful AI Security Operations Gateway")
 
-# System health indicators
-gateway_healthy = check_service_health(f"{GATEWAY_URL}/docs")
+# Service health
+gateway_healthy = check_service_health(f"{GATEWAY_URL}/health")
 ollama_healthy = check_service_health(f"{OLLAMA_URL}/")
 
-st.sidebar.markdown("### Service Telemetry")
-col_s1, col_s2 = st.sidebar.columns(2)
-with col_s1:
+st.sidebar.markdown("### Infrastructure Health")
+c1, c2 = st.sidebar.columns(2)
+with c1:
     if gateway_healthy:
         st.success("Gateway: 🟢 Online")
     else:
         st.error("Gateway: 🔴 Offline")
-with col_s2:
+with c2:
     if ollama_healthy:
         st.success("Ollama: 🟢 Online")
     else:
@@ -205,292 +259,377 @@ with col_s2:
 st.sidebar.divider()
 
 # Session Selector
-sessions_df = fetch_all_sessions()
+sessions_df = fetch_all_sessions_df()
 session_list = sessions_df["session_id"].tolist() if not sessions_df.empty else []
 
 selected_session = None
 if session_list:
     selected_session = st.sidebar.selectbox(
-        "Select Active Session",
+        "Select Monitored Session",
         options=session_list,
         index=0,
-        help="Select a session ID from SQLite to analyze its conversation timeline and drift graph."
+        help="Select a session ID to inspect its risk timeline, topic segmentation, and auditor verdict."
     )
     if selected_session:
-        session_info = sessions_df[sessions_df["session_id"] == selected_session].iloc[0]
-        st.sidebar.info(f"**Valid Turns:** {session_info['valid_turns']}\n\n**Last Active:** {session_info['last_seen']}")
+        s_info = sessions_df[sessions_df["session_id"] == selected_session].iloc[0]
+        status_color = "🔴" if s_info["status"] == "REVOKED" else ("🟡" if s_info["status"] == "RESET" else "🟢")
+        st.sidebar.info(
+            f"**Status:** {status_color} `{s_info['status']}`\n\n"
+            f"**Current Risk:** `{s_info['session_risk']:.1f}/100`\n\n"
+            f"**Turns:** {s_info['valid_turns']}\n\n"
+            f"**Last Activity:** {s_info['last_seen']}"
+        )
+        
+        # Section 22: Human Analyst Override Mechanism
+        st.sidebar.markdown("### 🧑‍💼 Human Override")
+        if s_info["status"] in ["REVOKED", "RESET"]:
+            st.sidebar.warning(f"Session is currently **{s_info['status']}**.")
+            override_reason = st.sidebar.text_input("Override Reason:", value="Analyst verified benign false alarm")
+            if st.sidebar.button("🔓 Unblock / Override Session", use_container_width=True):
+                try:
+                    oresp = requests.post(
+                        f"{GATEWAY_URL}/sessions/{selected_session}/override",
+                        json={"analyst_id": "SOC_ANALYST", "reason": override_reason},
+                        timeout=5.0
+                    )
+                    if oresp.status_code == 200:
+                        st.sidebar.success("Session unblocked successfully!")
+                        st.rerun()
+                    else:
+                        st.sidebar.error(f"Error: HTTP {oresp.status_code}")
+                except Exception as ex:
+                    st.sidebar.error(f"Override failed: {ex}")
+        else:
+            st.sidebar.caption("Session is active. Overrides apply when sessions are restricted.")
 else:
-    st.sidebar.warning("No sessions found in SQLite. Send prompts via the Playground tab to start.")
+    st.sidebar.warning("No sessions found. Send prompts in Playground tab to begin monitoring.")
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.rerun()
 
-st.sidebar.caption("Threshold: **0.35** (Cosine Similarity)")
+st.sidebar.caption("Response Tiers: 0–25 Allow · 26–45 Sanitize · 46–70 Reset · 71–100 Revoke")
+
 
 # ================= TOP KPI METRICS =================
-st.title("🛡️ Sentinel ATLAS Operations Center")
-st.caption("Live monitoring of intent drift, session vectors, and adversarial prompt detection.")
+st.title("🛡️ Sentinel ATLAS SOC Operations Center")
+st.caption("Real-Time Multi-Turn Semantic Gateway & Threat Defense")
 
-tot_sessions, tot_turns, tot_blocked, mean_sim = fetch_overview_metrics()
+act_sess, tot_reqs, act_thr, crit_thr, avg_risk, blk_sess = fetch_overview_metrics()
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("Monitored Sessions", tot_sessions)
-kpi2.metric("Total Valid Turns", tot_turns)
-kpi3.metric("Blocked Incidents", tot_blocked, delta=f"{tot_blocked} Intercepted" if tot_blocked > 0 else None, delta_color="inverse")
-kpi4.metric("Avg Similarity Score", f"{mean_sim:.3f}")
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric("Active Sessions", act_sess)
+k2.metric("Total Requests", tot_reqs)
+k3.metric("Active Threats", act_thr, delta=f"{act_thr} turns > 25" if act_thr > 0 else None, delta_color="inverse")
+k4.metric("Critical Threats", crit_thr, delta=f"{crit_thr} turns >= 71" if crit_thr > 0 else None, delta_color="inverse")
+k5.metric("Average Risk", f"{avg_risk:.1f}/100")
+k6.metric("Blocked Sessions", blk_sess)
 
 st.markdown("---")
 
+
 # ================= MAIN TABS =================
-tab_monitor, tab_audit, tab_attribution, tab_playground = st.tabs([
-    "📈 Session Drift Monitor", 
-    "🚨 Security Incidents Audit", 
-    "📑 Threat Attribution & AI Reports",
+tab_monitor, tab_topics, tab_atlas, tab_auditor, tab_attribution, tab_playground = st.tabs([
+    "📈 Risk & Drift Timeline",
+    "🏷️ Topic Segmentation",
+    "🎯 MITRE ATLAS Intelligence",
+    "🤝 Dual-Agent Auditor",
+    "📑 Threat Attribution & Reports",
     "🧪 Live Gateway Playground"
 ])
 
-# ------------- TAB 1: SESSION DRIFT MONITOR -------------
+
+# ------------- TAB 1: RISK & DRIFT TIMELINE -------------
 with tab_monitor:
     if not selected_session:
-        st.info("Select a session in the sidebar to inspect its timeline and vector similarity trajectory.")
+        st.info("Select a session in the sidebar to inspect its security timeline.")
     else:
-        timeline_df = fetch_session_timeline(selected_session)
-        
-        st.subheader(f"Session: `{selected_session}`")
-        
-        # Plotly Cosine Similarity Timeline
-        if not timeline_df.empty:
-            fig = go.Figure()
-            
-            # 0.35 Threshold Boundary
-            max_turn = max(timeline_df["turn_number"].max(), 1)
-            fig.add_shape(
-                type="line",
-                x0=0.5,
-                x1=max_turn + 0.5,
-                y0=0.35,
-                y1=0.35,
-                line=dict(color="#f85149", width=2, dash="dash"),
-                name="Drift Cutoff (0.35)"
+        turns_df = fetch_session_turns_df(selected_session)
+        st.subheader(f"Session Timeline: `{selected_session}`")
+
+        if turns_df.empty:
+            st.warning("No turns recorded for this session.")
+        else:
+            # 1. Plotly Risk Score Progression Chart (0 - 100)
+            fig_risk = go.Figure()
+
+            # Shaded tier bands
+            fig_risk.add_hrect(y0=0, y1=25, fillcolor="#0e4429", opacity=0.25, line_width=0, annotation_text="ALLOW (0–25)", annotation_position="top left")
+            fig_risk.add_hrect(y0=26, y1=45, fillcolor="#4d3800", opacity=0.25, line_width=0, annotation_text="SANITIZE (26–45)", annotation_position="top left")
+            fig_risk.add_hrect(y0=46, y1=70, fillcolor="#5a1e02", opacity=0.25, line_width=0, annotation_text="RESET (46–70)", annotation_position="top left")
+            fig_risk.add_hrect(y0=71, y1=100, fillcolor="#490202", opacity=0.25, line_width=0, annotation_text="REVOKE (71–100)", annotation_position="top left")
+
+            fig_risk.add_trace(go.Scatter(
+                x=turns_df["turn_number"],
+                y=turns_df["risk_score"],
+                mode="lines+markers",
+                name="Risk Score (0–100)",
+                line=dict(color="#f85149", width=3),
+                marker=dict(size=10, color="#f85149", symbol="circle"),
+                hovertext=[f"Turn {r.turn_number}: Risk {r.risk_score} | Technique: {r.attack_technique}" for _, r in turns_df.iterrows()],
+                hoverinfo="text"
+            ))
+
+            fig_risk.update_layout(
+                title="Dynamic Composite Risk Score Trajectory (0–100)",
+                xaxis_title="Conversation Turn",
+                yaxis_title="Risk Score",
+                yaxis=dict(range=[-2, 102], gridcolor="#2d3342"),
+                xaxis=dict(tickmode="linear", dtick=1, gridcolor="#2d3342"),
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=340
             )
-            fig.add_annotation(
-                x=max_turn + 0.5,
-                y=0.35,
-                text="<b>Threshold (0.35)</b>",
-                showarrow=False,
-                yshift=10,
-                font=dict(color="#f85149", size=11)
-            )
-            
-            # Safe turns
-            safe_df = timeline_df[timeline_df["status"] == "success"]
-            if not safe_df.empty:
-                fig.add_trace(go.Scatter(
-                    x=safe_df["turn_number"],
-                    y=safe_df["similarity_score"],
-                    mode="lines+markers",
-                    name="Allowed Turn",
-                    line=dict(color="#3fb950", width=3),
-                    marker=dict(size=10, color="#3fb950", symbol="circle"),
-                    hovertext=[f"Turn {row.turn_number}: {row.message_text[:60]}... (Score: {row.similarity_score})" for _, row in safe_df.iterrows()],
-                    hoverinfo="text"
-                ))
-                
-            # Blocked turns
-            blocked_df = timeline_df[timeline_df["status"] == "blocked"]
-            if not blocked_df.empty:
-                fig.add_trace(go.Scatter(
-                    x=blocked_df["turn_number"],
-                    y=blocked_df["similarity_score"],
-                    mode="markers",
-                    name="Blocked (Drift)",
-                    marker=dict(size=14, color="#f85149", symbol="x", line=dict(width=2, color="#ffffff")),
-                    hovertext=[f"Turn {row.turn_number}: BLOCKED '{row.message_text[:60]}...' (Score: {row.similarity_score})" for _, row in blocked_df.iterrows()],
-                    hoverinfo="text"
-                ))
-                
-            fig.update_layout(
-                title="Intent Anchor Cosine Similarity Across Turns",
-                xaxis_title="Turn Number",
-                yaxis_title="Cosine Similarity",
+            st.plotly_chart(fig_risk, use_container_width=True)
+
+            # 2. Semantic Drift Timeline Chart
+            fig_drift = go.Figure()
+            fig_drift.add_trace(go.Scatter(
+                x=turns_df["turn_number"],
+                y=turns_df["drift_score"],
+                mode="lines+markers",
+                name="Rolling 4-Turn Drift",
+                line=dict(color="#388bfd", width=2),
+                marker=dict(size=8, color="#388bfd")
+            ))
+            fig_drift.add_trace(go.Scatter(
+                x=turns_df["turn_number"],
+                y=turns_df["similarity_score"],
+                mode="lines+markers",
+                name="Anchor Similarity",
+                line=dict(color="#3fb950", width=2, dash="dot"),
+                marker=dict(size=8, color="#3fb950")
+            ))
+            fig_drift.update_layout(
+                title="Semantic Drift & Session Intent Similarity Progression",
+                xaxis_title="Conversation Turn",
+                yaxis_title="Score (0.0 to 1.0)",
                 yaxis=dict(range=[-0.05, 1.05], gridcolor="#2d3342"),
                 xaxis=dict(tickmode="linear", dtick=1, gridcolor="#2d3342"),
                 template="plotly_dark",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=40, r=40, t=60, b=40),
-                height=350
+                height=280
             )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Conversation Transcript
-            st.markdown("### Conversation Transcript")
-            for _, row in timeline_df.iterrows():
-                is_safe = (row["status"] == "success")
-                badge_html = (
-                    f"<span class='badge-success'>✅ Turn {row['turn_number']} — Allowed (Score: {row['similarity_score']:.4f})</span>"
-                    if is_safe else
-                    f"<span class='badge-blocked'>🚨 Turn {row['turn_number']} — BLOCKED DRIFT (Score: {row['similarity_score']:.4f})</span>"
-                )
-                
+            st.plotly_chart(fig_drift, use_container_width=True)
+
+            # 3. Transparent Turn-by-Turn Inspection
+            st.markdown("### 💬 Conversation Transcript & Security Verdicts")
+            for _, r in turns_df.iterrows():
+                score = r["risk_score"]
+                if score >= 71:
+                    badge_cls = "badge-revoke"
+                    action_lbl = "REVOKED"
+                elif score >= 46:
+                    badge_cls = "badge-reset"
+                    action_lbl = "RESET"
+                elif score >= 26:
+                    badge_cls = "badge-sanitize"
+                    action_lbl = "SANITIZED"
+                else:
+                    badge_cls = "badge-allow"
+                    action_lbl = "ALLOWED"
+
                 st.markdown(f"""
                 <div style="margin-bottom: 6px;">
-                    {badge_html} <span style="font-size:11px; color:#8b949e; margin-left: 8px;">{row['timestamp']}</span>
+                    <span class='{badge_cls}'>Turn {r['turn_number']} · {action_lbl} (Risk: {score:.0f}/100)</span>
+                    <span style="font-size:12px; color:#8b949e; margin-left: 10px;">Topic: <b>{r['topic_id']}</b> · Technique: <b>{r['attack_technique']}</b></span>
                 </div>
                 <div class="chat-bubble-user">
-                    <b>User:</b> {row['message_text']}
+                    <b>User:</b> {r['message_text']}
+                </div>
+                <div class="chat-bubble-ai">
+                    <b>Worker AI Response:</b><br>{r['llm_response']}
                 </div>
                 """, unsafe_allow_html=True)
-                
-                if is_safe:
-                    st.markdown(f"""
-                    <div class="chat-bubble-ai">
-                        <b>Gateway Response (LLM):</b><br>{row['llm_response']}
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""
-                    <div class="chat-bubble-blocked">
-                        <b>Interception Reason:</b> {row['llm_response']}
-                    </div>
-                    """, unsafe_allow_html=True)
-        else:
-            st.warning("No records found for this session.")
 
-# ------------- TAB 2: SECURITY AUDIT LOG -------------
-with tab_audit:
-    st.subheader("Security Incidents & Adversarial Interception Log")
-    st.caption("Historical log of all prompts blocked by the cosine similarity intent guardrail.")
-    
-    events_df = fetch_all_security_events()
-    if events_df.empty:
-        st.success("No security incidents recorded yet. All sessions are compliant with established intent anchors.")
-    else:
-        st.dataframe(
-            events_df,
-            column_config={
-                "id": st.column_config.NumberColumn("ID", width="small"),
-                "session_id": st.column_config.TextColumn("Session ID", width="medium"),
-                "turn_number": st.column_config.NumberColumn("Turn #", width="small"),
-                "message_text": st.column_config.TextColumn("Intercepted Prompt", width="large"),
-                "similarity_score": st.column_config.NumberColumn("Similarity", format="%.4f"),
-                "threshold": st.column_config.NumberColumn("Threshold", format="%.2f"),
-                "reason": st.column_config.TextColumn("Reason", width="medium"),
-                "timestamp": st.column_config.DatetimeColumn("Timestamp", width="medium")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-        
-        csv_data = events_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Export Audit Log (CSV)",
-            data=csv_data,
-            file_name=f"sentinel_security_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
 
-# ------------- TAB 3: THREAT ATTRIBUTION & AI REPORTS -------------
-with tab_attribution:
-    st.subheader("📑 Threat Attribution & Dual-Agent Consensus")
-    st.caption("Traces sustained attack paths (Persistence Score), dual-agent consensus verdicts, and AI-synthesized incident reports.")
+# ------------- TAB 2: TOPIC SEGMENTATION -------------
+with tab_topics:
+    st.subheader("🏷️ Local Topic Anchors & Topic Timeline")
+    st.caption("Tracks how conversation branches into distinct local topics, separating legitimate topic changes from semantic attack drift.")
 
     if not selected_session:
-        st.info("Select a session in the sidebar to view its threat attribution analysis.")
+        st.info("Select a session in sidebar to inspect topic segmentation.")
     else:
-        # Fetch persistence and path data via API or DB
-        try:
-            pers_res = requests.get(f"{GATEWAY_URL}/attribution/persistence/{selected_session}", timeout=3.0)
-            persistence_data = pers_res.json() if pers_res.status_code == 200 else {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
-        except Exception:
-            persistence_data = {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+        topics_df = fetch_session_topics_df(selected_session)
+        if topics_df.empty:
+            st.info("No topic segments registered for this session yet.")
+        else:
+            st.dataframe(
+                topics_df,
+                column_config={
+                    "topic_id": st.column_config.TextColumn("Topic ID", width="small"),
+                    "topic_name": st.column_config.TextColumn("Topic Title", width="medium"),
+                    "first_turn": st.column_config.NumberColumn("Start Turn", width="small"),
+                    "last_turn": st.column_config.NumberColumn("End Turn", width="small"),
+                    "is_benign": st.column_config.CheckboxColumn("Benign Intent", width="small"),
+                    "created_at": st.column_config.DatetimeColumn("Established At", width="medium"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
 
-        col_p1, col_p2, col_p3 = st.columns(3)
-        col_p1.metric("Persistence Streak", f"{persistence_data['max_streak']} Turns", help="Maximum consecutive turns exhibiting semantic drift or security flags.")
-        col_p2.metric("Sustained Exploit Intent", "🚨 YES" if persistence_data['sustained_intent'] else "✅ NO", help="Flagged if 3 or more consecutive turns show anomalous semantic drift.")
-        col_p3.metric("Selected Session", f"`{selected_session[:14]}...`")
+            # Visual Topic Timeline Cards per Section 22
+            st.markdown("### 🗺️ Topic Evolution Timeline")
+            for _, top in topics_df.iterrows():
+                icon = "🟢" if top["is_benign"] else "🚨"
+                turns_span = f"Turns T{top['first_turn']} → T{top['last_turn']}" if top['first_turn'] != top['last_turn'] else f"Turn T{top['first_turn']}"
+                st.markdown(f"""
+                <div class="trajectory-step">
+                    <b>{icon} {top['topic_name']}</b> &nbsp; · &nbsp; <code>{top['topic_id']}</code> &nbsp; · &nbsp; <span style="color:#58a6ff;">{turns_span}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-        st.markdown("---")
 
-        # Dual-Agent Consensus Events
-        st.markdown("### 🤝 Dual-Agent Consensus (ATLAS Bridge)")
-        st.caption("Worker Agent proposed action vs. Asynchronous Auditor Agent alignment verdict.")
+# ------------- TAB 3: MITRE ATLAS INTELLIGENCE -------------
+with tab_atlas:
+    st.subheader("🎯 MITRE ATLAS Attack Attribution")
+    st.caption("Vector similarity mapping against known adversarial techniques (ChromaDB index).")
+
+    atlas_df = fetch_atlas_frequency_df()
+    if atlas_df.empty:
+        st.info("No MITRE ATLAS matches recorded in gateway database yet.")
+    else:
+        col_a1, col_a2 = st.columns([2, 1])
+        with col_a1:
+            fig_bar = px.bar(
+                atlas_df,
+                x="technique_name",
+                y="occurrences",
+                color="occurrences",
+                labels={"technique_name": "MITRE ATLAS Technique", "occurrences": "Detected Occurrences"},
+                title="Top MITRE ATLAS Techniques Flagged Across Gateway",
+                template="plotly_dark"
+            )
+            fig_bar.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with col_a2:
+            st.markdown("### Technique Breakdown")
+            st.dataframe(atlas_df, hide_index=True, use_container_width=True)
+
+
+# ------------- TAB 4: DUAL-AGENT AUDITOR -------------
+with tab_auditor:
+    st.subheader("🤝 ATLAS Bridge (Dual-Agent Consensus)")
+    st.caption("Independent Auditor Agent evaluating Worker proposed actions against original user intent.")
+
+    if not selected_session:
+        st.info("Select a session in sidebar to view Auditor decisions.")
+    else:
         conn = get_db_connection()
         try:
-            consensus_df = pd.read_sql_query(
-                "SELECT turn_number, iaa_score, auditor_verdict, auditor_reason, timestamp FROM consensus_events WHERE session_id = ? ORDER BY turn_number DESC",
+            auditor_df = pd.read_sql_query(
+                "SELECT turn_number, verdict, confidence, reason, timestamp FROM auditor_decisions WHERE session_id = ? ORDER BY turn_number DESC",
                 conn,
                 params=(selected_session,)
             )
         except Exception:
-            consensus_df = pd.DataFrame()
+            auditor_df = pd.DataFrame()
         conn.close()
 
-        if consensus_df.empty:
-            st.info("No dual-agent consensus events recorded for this session yet.")
+        if auditor_df.empty:
+            st.info("No structured auditor decisions recorded for this session yet.")
         else:
             st.dataframe(
-                consensus_df,
+                auditor_df,
                 column_config={
                     "turn_number": st.column_config.NumberColumn("Turn #", width="small"),
-                    "iaa_score": st.column_config.NumberColumn("IAA Alignment", format="%.4f"),
-                    "auditor_verdict": st.column_config.TextColumn("Auditor Verdict", width="small"),
-                    "auditor_reason": st.column_config.TextColumn("Auditor Rationale", width="large"),
+                    "verdict": st.column_config.TextColumn("Auditor Verdict", width="small"),
+                    "confidence": st.column_config.NumberColumn("Confidence", format="%.2f"),
+                    "reason": st.column_config.TextColumn("Auditor Rationale", width="large"),
                     "timestamp": st.column_config.DatetimeColumn("Timestamp", width="medium"),
                 },
                 hide_index=True,
                 use_container_width=True
             )
 
+
+# ------------- TAB 5: THREAT ATTRIBUTION & AI REPORTS -------------
+with tab_attribution:
+    st.subheader("📑 Threat Attribution & Attack Trajectory")
+    st.caption("Traces sustained attack paths, persistence scores, and plain-English SOC threat attribution reports.")
+
+    if not selected_session:
+        st.info("Select a session in sidebar to view its threat attribution.")
+    else:
+        try:
+            pers_res = requests.get(f"{GATEWAY_URL}/attribution/persistence/{selected_session}", timeout=3.0)
+            persistence_data = pers_res.json() if pers_res.status_code == 200 else {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+        except Exception:
+            persistence_data = {"current_streak": 0, "max_streak": 0, "sustained_intent": False}
+
+        cp1, cp2, cp3 = st.columns(3)
+        cp1.metric("Threat Persistence Streak", f"{persistence_data.get('max_streak', 0)} Turns", help="Consecutive turns exhibiting anomalous drift or technique matches.")
+        cp2.metric("Sustained Attack Detected", "🚨 YES" if persistence_data.get("sustained_intent") else "✅ NO", help="Triggered if 3 or more consecutive turns exhibit anomalous signals.")
+        cp3.metric("Selected Session", f"`{selected_session[:14]}...`")
+
         st.markdown("---")
 
-        # Executive Incident Report Generation
-        st.markdown("### 📝 Plain-English SOC Threat Attribution Report")
-        st.caption("Generates a comprehensive incident report using local Ollama, detailing attacker progression across MITRE ATLAS tactics over time.")
+        # Step-by-Step Attack Trajectory per Section 22
+        st.markdown("### 🪜 Attack Trajectory Walkthrough")
+        try:
+            traj_res = requests.get(f"{GATEWAY_URL}/sessions/{selected_session}/trajectory", timeout=3.0)
+            trajectory_list = traj_res.json().get("trajectory", []) if traj_res.status_code == 200 else []
+        except Exception:
+            trajectory_list = []
 
-        if st.button("⚡ Generate AI Threat Attribution Report", key="btn_gen_report", use_container_width=True):
-            with st.spinner("Local Ollama analyzing session progression and generating report..."):
+        if not trajectory_list:
+            st.info("No multi-turn trajectory available for this session.")
+        else:
+            for step in trajectory_list:
+                r_val = step.get("risk_score") or 0.0
+                step_status = "CRITICAL" if r_val >= 71 else ("HIGH" if r_val >= 46 else ("MEDIUM" if r_val >= 26 else "NORMAL"))
+                st.markdown(f"""
+                <div class="trajectory-step">
+                    <b>Turn {step['turn']}:</b> <code>{step_status}</code> (Risk {r_val:.0f}/100) &nbsp; | &nbsp; 
+                    Prompt: <i>"{step['prompt'][:80]}..."</i> &nbsp; | &nbsp; 
+                    Technique: <b>{step['technique']}</b>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("### 📝 Plain-English SOC Threat Attribution Report")
+        if st.button("⚡ Generate AI Threat Attribution Report", key="btn_report", use_container_width=True):
+            with st.spinner("Local Ollama analyzing session progression across MITRE ATLAS tactics..."):
                 try:
                     rep_res = requests.get(f"{GATEWAY_URL}/attribution/report/{selected_session}", timeout=45.0)
                     if rep_res.status_code == 200:
                         report_content = rep_res.json().get("report", "No report generated.")
-                        st.session_state[f"report_{selected_session}"] = report_content
+                        st.session_state[f"rep_{selected_session}"] = report_content
                     else:
-                        st.error(f"Error from report API: HTTP {rep_res.status_code}")
+                        st.error(f"Report API returned HTTP {rep_res.status_code}")
                 except Exception as ex:
                     st.error(f"Could not connect to Gateway: {ex}")
 
-        saved_report = st.session_state.get(f"report_{selected_session}")
-        if saved_report:
+        saved_rep = st.session_state.get(f"rep_{selected_session}")
+        if saved_rep:
             st.markdown(f"""
-            <div style="background-color:#161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-top: 15px;">
-                {saved_report}
+            <div style="background-color:#161b22; border: 1px solid #30363d; border-radius: 8px; padding: 18px; margin-top: 15px;">
+                {saved_rep}
             </div>
             """, unsafe_allow_html=True)
 
-# ------------- TAB 4: LIVE GATEWAY PLAYGROUND -------------
+
+# ------------- TAB 6: LIVE GATEWAY PLAYGROUND -------------
 with tab_playground:
     st.subheader("Interactive Security Gateway Playground")
     st.caption("Test prompts directly against your running FastAPI security proxy (`http://127.0.0.1:8000/chat`).")
-    
-    p_col1, p_col2 = st.columns([2, 1])
-    with p_col1:
-        session_choice = st.radio(
-            "Session Context Mode:",
-            ["Active Selected Session", "New Anonymous Session"],
-            horizontal=True
-        )
-    with p_col2:
+
+    p1, p2 = st.columns([2, 1])
+    with p1:
+        session_choice = st.radio("Session Context:", ["Active Selected Session", "New Anonymous Session"], horizontal=True)
+    with p2:
         target_session = selected_session if (session_choice == "Active Selected Session" and selected_session) else None
         st.text_input("Active Target Session ID", value=target_session or "(Auto-generate new UUID)", disabled=True)
 
-    with st.form("playground_form", clear_on_submit=False):
+    with st.form("pg_form", clear_on_submit=False):
         prompt_input = st.text_area(
             "Enter prompt to test:",
-            placeholder="Type a test prompt (e.g. cloud security question, or an off-topic question like baking brownies)...",
-            height=100
+            placeholder="Type a prompt (e.g. cloud security question, baking brownies, or adversarial prompt)...",
+            height=90
         )
         submit_btn = st.form_submit_button("🚀 Submit to Gateway", use_container_width=True)
 
@@ -498,36 +637,39 @@ with tab_playground:
         payload = {"message": prompt_input.strip()}
         if target_session:
             payload["session_id"] = target_session
-            
+
         try:
-            with st.spinner("Evaluating prompt with Sentinel ATLAS..."):
+            with st.spinner("Sentinel ATLAS processing intent, topics, and risk factors..."):
                 resp = requests.post(f"{GATEWAY_URL}/chat", json=payload, timeout=65.0)
-                
+
             if resp.status_code == 200:
                 data = resp.json()
-                status = data.get("status")
-                sim_score = data.get("similarity_score", 0.0)
-                playbook_act = data.get("playbook_action", "allow")
-                is_sanitized = data.get("sanitized", False)
-                
-                if status == "success":
-                    if is_sanitized:
-                        st.warning(f"🛡️ **Playbook: Context Sanitisation Applied!** (Score 26–45). Adversarial framing stripped; forwarded clean intent.")
-                    else:
-                        st.success(f"✅ **Request Allowed!** Cosine Similarity: `{sim_score:.4f}` >= `0.35` | Playbook: `{playbook_act}`")
-                    
-                    with st.chat_message("assistant"):
-                        st.markdown(f"**LLM Output:**\n\n{data.get('llm_response')}")
-                else:
-                    st.error(f"🚨 **Request Blocked!** Intercepted at Gate: `{data.get('gate')}` | Playbook: `{playbook_act}`")
-                    st.warning(f"**Reason:** {data.get('reason')}")
-                
+                decision = data.get("decision", "ALLOW")
+                risk_score = data.get("risk_score", 0)
+                topic_changed = data.get("topic_changed", False)
+                breakdown = data.get("risk_breakdown", {})
+
+                if decision == "ALLOW":
+                    st.success(f"✅ **Request ALLOWED!** Risk Score: `{risk_score}/100` | Topic Changed: `{topic_changed}`")
+                elif decision == "SANITIZE":
+                    st.warning(f"🛡️ **Playbook: CONTEXT SANITISATION Applied!** (Risk: `{risk_score}/100`). Adversarial framing neutralized.")
+                elif decision == "RESET":
+                    st.error(f"⚠️ **Playbook: SESSION RESET Triggered!** (Risk: `{risk_score}/100`). Conversational memory reset.")
+                else: # REVOKE
+                    st.error(f"🚨 **Playbook: ACCESS REVOCATION!** (Risk: `{risk_score}/100`). Session terminated.")
+
+                with st.chat_message("assistant"):
+                    st.markdown(f"**AI Response:**\n\n{data.get('response')}")
+
+                # Section 19: Transparent Risk Breakdown Card
+                st.markdown("### 🧮 Transparent Risk Calculation Breakdown")
+                st.json(breakdown)
+
                 st.json(data)
-                if st.button("🔄 Refresh Timeline to View Turn in Monitor"):
+                if st.button("🔄 Refresh View to Display Turn"):
                     st.rerun()
             else:
                 st.error(f"Gateway Error: Received HTTP status code {resp.status_code}")
                 st.code(resp.text)
         except Exception as e:
-            st.error(f"Could not connect to Gateway at {GATEWAY_URL}. Is `python main.py` running?")
-            st.caption(str(e))
+            st.error(f"Could not connect to Gateway at {GATEWAY_URL}: {e}")

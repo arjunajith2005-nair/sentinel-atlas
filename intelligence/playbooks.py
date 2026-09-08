@@ -75,11 +75,19 @@ def execute_session_reset(session_id: str) -> Dict:
     """
     Session Reset Playbook (Score 46 - 70):
     Wipes the session's conversational turns from SQLite so the multi-turn
-    Crescendo attack memory is broken, and clears the intent anchor.
+    Crescendo attack memory is broken, and clears the intent anchor and local topic.
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM session_turns WHERE session_id = ?", (session_id,))
+    cursor.execute(
+        "UPDATE sessions SET status = 'RESET', session_risk = 0.0, intent_anchor = '[]', current_topic_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+        (session_id,)
+    )
+    cursor.execute(
+        "INSERT INTO alerts (session_id, turn_number, alert_type, severity, details) VALUES (?, 0, 'SESSION_RESET', 'HIGH', 'Session reset playbook triggered due to elevated multi-turn risk.')",
+        (session_id,)
+    )
     conn.commit()
     conn.close()
 
@@ -90,23 +98,39 @@ def execute_session_reset(session_id: str) -> Dict:
 
     return {
         "status": "reset",
-        "action": "reset",
-        "reason": "Security Playbook Triggered: Session memory and intent anchor have been reset due to high risk."
+        "action": "RESET",
+        "decision": "RESET",
+        "reason": "Security Playbook Triggered: Session memory and intent anchor have been reset due to high risk (46-70)."
     }
 
 
 def execute_access_revocation(session_id: str) -> Dict:
     """
-    Access Revocation Playbook (Score > 70):
-    Immediately terminates access for the session and records revocation.
+    Access Revocation Playbook (Score 71 - 100):
+    Immediately terminates access for the session and records revocation in sessions table.
     """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sessions SET status = 'REVOKED', updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+        (session_id,)
+    )
+    cursor.execute(
+        "INSERT INTO alerts (session_id, turn_number, alert_type, severity, details) VALUES (?, 0, 'ACCESS_REVOCATION', 'CRITICAL', 'Session revoked due to critical threat risk score (>70).')",
+        (session_id,)
+    )
+    conn.commit()
+    conn.close()
+
     log_security_event("access_revocation", session_id, {
         "action": "playbook_revoke",
-        "details": "Immediate access revocation due to critical risk score (>0.70)."
+        "details": "Immediate access revocation due to critical risk score (71-100)."
     })
 
     return {
         "status": "blocked",
-        "action": "revoke",
-        "reason": "Security Playbook Triggered: Access Revocation. Critical threat risk score exceeded."
+        "action": "REVOKE",
+        "decision": "REVOKE",
+        "reason": "Security Playbook Triggered: Access Revocation. Critical threat risk score (71-100) exceeded."
     }
+

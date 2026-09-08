@@ -1,14 +1,17 @@
 import httpx
 import os
 
-TARGET_LLM_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+TARGET_LLM_URL = OLLAMA_URL
+MODEL_NAME = os.getenv("MODEL_NAME", "llama3.2:1b")
 
 async def forward_to_llm(user_message: str) -> str:
     payload = {
-        "model": "llama3.2:1b",
+        "model": MODEL_NAME,
         "prompt": user_message,
         "stream": False  # Crucial to return a single JSON object instead of streaming
     }
+
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
