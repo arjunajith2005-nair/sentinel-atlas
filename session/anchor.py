@@ -22,9 +22,19 @@ def compute_intent_anchor(history: list[dict], min_tokens: int = 10) -> list[flo
     
     # If opening turn is below threshold, wait for turn 2 and compute mean embedding
     if len(history) >= 2:
+        second_turn_text = history[1].get("message_text", "")
         second_turn_emb = history[1]["embedding"]
-        avg_vector = (np.array(first_turn_emb) + np.array(second_turn_emb)) / 2.0
-        return avg_vector.tolist()
+        combined_tokens = token_count + len(second_turn_text.strip().split())
+        if combined_tokens >= min_tokens:
+            avg_vector = (np.array(first_turn_emb) + np.array(second_turn_emb)) / 2.0
+            return avg_vector.tolist()
         
-    # Temporary fallback for turn 1 before turn 2 arrives
-    return first_turn_emb
+        # Look for the first turn in history with sufficient substance
+        for turn in history[1:]:
+            t_tokens = len(turn.get("message_text", "").strip().split())
+            if t_tokens >= min_tokens:
+                return turn["embedding"]
+        return []
+        
+    # Defer anchor until more substantive context arrives
+    return []

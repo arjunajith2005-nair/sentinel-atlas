@@ -18,7 +18,7 @@ st.set_page_config(
 # Resolve database path relative to workspace
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DB_PATH = os.path.join(BASE_DIR, "sentinel_sessions.db")
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8001")
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
 # Custom CSS for dark cybersecurity dashboard aesthetic
@@ -176,7 +176,7 @@ def fetch_all_security_events():
 
 def check_service_health(url):
     try:
-        res = requests.get(url, timeout=1.5)
+        res = requests.get(url, timeout=5.0)
         return res.status_code in [200, 404, 307]
     except Exception:
         return False
@@ -186,7 +186,7 @@ st.sidebar.title("🛡️ Sentinel ATLAS")
 st.sidebar.caption("Real-Time AI Security Operations Gateway")
 
 # System health indicators
-gateway_healthy = check_service_health(f"{GATEWAY_URL}/docs")
+gateway_healthy = check_service_health(f"{GATEWAY_URL}/health")
 ollama_healthy = check_service_health(f"{OLLAMA_URL}/")
 
 st.sidebar.markdown("### Service Telemetry")

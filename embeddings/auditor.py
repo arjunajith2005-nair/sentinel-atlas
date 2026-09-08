@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 
 OLLAMA_GENERATE_URL = "http://127.0.0.1:11434/api/generate"
-AUDITOR_MODEL = "llama3.2:1b"
+AUDITOR_MODEL = "smollm:135m"
 
 
 def calculate_iaa_score(anchor_vec: list[float], response_text: str) -> float:
@@ -70,7 +70,12 @@ class AsyncAuditor:
             "model": self.model,
             "prompt": audit_prompt,
             "stream": False,
-            "format": "json"
+            "format": "json",
+            "keep_alive": "30m",
+            "options": {
+                "num_predict": 35,
+                "temperature": 0.0
+            }
         }
 
         audit_result = {

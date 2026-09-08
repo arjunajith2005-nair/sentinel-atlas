@@ -40,6 +40,11 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
 
+@app.get("/health")
+async def health_check():
+    """Ultra-fast non-blocking health check for dashboard telemetry."""
+    return {"status": "online", "service": "Sentinel ATLAS Gateway"}
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks):
     session_id = request.session_id if request.session_id else str(uuid.uuid4())
@@ -329,4 +334,4 @@ async def get_session_persistence(session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8001, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

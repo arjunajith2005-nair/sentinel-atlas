@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 from session.db import get_session_history, get_security_events, DB_PATH
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-REPORT_MODEL = "llama3.2:1b"
+REPORT_MODEL = "smollm:135m"
 
 
 def compute_persistence_score(session_id: str, similarity_threshold: float = 0.40) -> Dict:

@@ -166,7 +166,7 @@ def run_test_suite():
     with httpx.Client(timeout=65.0) as client:
         # Pre-check if server is reachable
         try:
-            health = client.get("http://127.0.0.1:8000/docs", timeout=15.0)
+            health = client.get("http://127.0.0.1:8000/health", timeout=15.0)
             if health.status_code != 200:
                 print("❌ ERROR: Gateway server is not responding at http://127.0.0.1:8000. Start it with `python main.py`.")
                 sys.exit(1)
